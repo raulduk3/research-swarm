@@ -508,11 +508,11 @@ The missing contract is to reconcile and verify these declared inputs within the
 
 `mate_genomes(parent, mate, existing, seed)` must return a novel child content mapping with mutation description, or `None` when no offered child is novel.
 
-The rule combines parent prompt content with the mate’s focus text, reading strategy, mean temperature and tool union, then applies a seeded single-field mutation. It builds new mappings rather than mutating source genomes.
+The rule keeps the parent’s own prompt, stripped of any emphasis paragraph or line that earlier breeding added, and adds the mate’s bent as one `Additional reading emphasis` paragraph, likewise stripped, with the mate’s reading strategy, mean temperature and tool union, then applies a seeded single-field mutation. It builds new mappings rather than mutating source genomes, and a child of a child carries one added paragraph, not its ancestors’.
 
-Research methods are combined from both actual parents, including model-proposed children’s declared parents. `mix_methods` retains unique instruction units and source URLs in parent order, uses the maximum profile version and marks different domains as `mixed` without claiming specialist qualification. Mutation retains its parent’s methods. Final persistence cannot reset inherited methods to island defaults. Effective instructions participate in novelty comparison; source metadata alone does not make a new behavior.
+Research methods are the island parent’s own, for rule-bred and model-proposed children alike; the mate’s island lends no domain methods, so a lineage never grows past the methods limit. Mutation retains its parent’s methods. Final persistence cannot reset inherited methods to island defaults. Effective instructions participate in novelty comparison; source metadata alone does not make a new behavior.
 
-`test_mating_keeps_both_method_contributions_once` checks both parents’ instructions and sources. `test_persisted_evolution_keeps_actual_parent_methods` catches a persistence-time island-default reset. `test_instruction_normalization_preserves_scientific_text`, `test_normalization_keeps_distinct_literal_whitespace`, `test_distinct_literal_whitespace_is_a_real_prompt_difference` and `test_run_prompt_removes_duplicates_across_instruction_fields` check literal normalized output and the stored provider prompt.
+`test_mating_keeps_the_parents_methods_and_says_an_instruction_once` and `test_chained_mating_adds_one_emphasis_and_no_methods` catch a mate’s methods or a grandparent’s paragraph in the child. `test_persisted_evolution_keeps_actual_parent_methods` catches a persistence-time island-default reset. `test_instruction_normalization_preserves_scientific_text`, `test_normalization_keeps_distinct_literal_whitespace`, `test_distinct_literal_whitespace_is_a_real_prompt_difference` and `test_run_prompt_removes_duplicates_across_instruction_fields` check literal normalized output and the stored provider prompt.
 
 `test_mating_is_repeatable_and_never_repeats_an_existing_agent` catches nondeterministic or duplicate children. `test_the_run_threshold_breeds_a_child_from_the_island_and_another` checks cross-island parent identity in recorded decisions.
 
@@ -690,6 +690,8 @@ Malformed JSON arguments for `submit_reading` have a distinct existing path: the
 <!-- id: TDD-4.2.5 | implements: RN-02 | code: src/research_agent/beta/runs.py#dispatch_tool_call | tests: tests/beta/test_runs.py | status: implemented -->
 
 The harness must expose only the tool schemas offered for the current call. At the final submission stage it offers `submit_reading` alone and records the harness notice.
+
+The run system text carries the harness rules after the genome's own prompt, and the `submit_reading` schema describes `summary`: both say the summary is a plain-language explanation for someone who knows nothing about the field (the problem, what was done, what was found, why it matters, each term defined or left out) and that the claims, objections and idea seeds keep the full depth. A genome prompt cannot remove that rule. `test_the_harness_asks_for_a_newcomers_summary_whatever_the_agent_says` catches a run prompt or schema without it.
 
 Paper retrieval returns bounded passage content and produces `paper_read` events for the passages actually returned. Large stored full text can be listed and read by tool rather than included wholesale in the initial prompt.
 
@@ -1020,9 +1022,9 @@ Agent detail reads receipts directly by their durable `genome_id` and returns se
 #### TDD-5.2.8 Current parent and retirement ordering
 <!-- id: TDD-5.2.8 | implements: CT-03 | code: src/research_agent/beta/evolution.py#maybe_run_evolution | tests: tests/beta/test_evolution.py | status: implemented -->
 
-The current rule path selects the island parent by the maximum tuple of like points, completed-run count and genome ID. Cost is not an input. A seeded choice selects a mate from active genomes on nonarchived other islands.
+The current rule path selects the island parent by turn: among the evaluated agents (completed runs at or above `runs_threshold`), the minimum tuple of the last committed generation that bred from it, negative like points, negative completed-run count and age in the island’s genome list; while no agent is evaluated, those with any completed run, and failing that every active agent. Cost is not an input. A seeded choice selects a mate from active genomes on nonarchived other islands.
 
-Population-cap retirement selects the minimum completed-run count and genome ID among eligible nonparents; a valid model-requested retirement records its reason. These are current selection rules, not usefulness bands or cost tie-breaks. `test_the_breeder_may_fail_out_a_lemon_and_likes_pick_the_parent` shows one like outweighing six completed runs. `test_over_its_cap_the_island_archives_its_least_run_agent` verifies retirement ordering.
+Population-cap retirement selects, among eligible evaluated nonparents, the minimum tuple of like points, negative completed-run count and age, so the agent with the most runs and fewest likes goes and an unevaluated child stays; when no eligible agent is evaluated the cycle is skipped as `population_unevaluated`. A valid model-requested retirement records its reason. These are current selection rules, not usefulness bands or cost tie-breaks. `test_the_parent_turns_and_likes_go_first_among_equals` shows the turn passing through every founder with the liked one first. `test_the_breeder_may_fail_out_a_lemon_and_likes_pick_the_parent` shows a liked agent with one run waiting for an evaluated one. `test_over_its_cap_the_island_archives_its_most_run_evaluated_agent` and `test_a_child_waits_while_nobody_else_has_been_evaluated` verify retirement ordering and the skip.
 
 <a id="tdd-5.2.9"></a>
 
@@ -1174,7 +1176,9 @@ An admitted proposal request exposes only `propose_child`, uses temperature 0.9 
 
 A proposal needs known parent IDs with at least one from the target island. Unknown tools are filtered and `submit_reading` retained. Temperature is clamped to 0.1 through 1.2, output allowance to 256 through 2,000, prompt to 1,800 characters and strategy to 600. The genome is validated and must not repeat existing content. Missing tools, unparsable argument text, wrong-island parents and rejected genomes return proposal outcomes; no accepted child invokes seeded rule breeding.
 
-The configured-proposal test verifies model lineage and cost. The failed-or-useless-proposal test verifies typed provider failure and wrong-island fallback.
+Whatever the model did is kept on the child’s `created` decision as `proposal` (`proposed`, `refused`, `failed`, `no_proposal`, `malformed_proposal`, `no_parent_on_island`, `invalid_proposal`, `repeats_an_agent`, or `not_asked` without a provider) with its `proposal_reason`, so a generation says why the rule bred.
+
+The configured-proposal test verifies model lineage, cost and the recorded outcome. The failed-or-useless-proposal test verifies typed provider failure and wrong-island fallback with their recorded outcomes.
 
 <a id="tdd-6.2.8"></a>
 
@@ -1190,11 +1194,11 @@ Only completed-run counting and force are implemented. Feedback thresholds are d
 #### TDD-6.2.9 Seeded breeding, novelty and ancestry
 <!-- id: TDD-6.2.9 | implements: EV-03 | code: src/research_agent/beta/evolution.py#mate_genomes | tests: tests/beta/test_evolution.py | status: implemented -->
 
-Rule mating preserves the parent's main prompt, adds the mate's reading emphasis, takes the mate's strategy, averages temperatures and combines tools before offering one seeded field mutation. Plain mutation applies when no cross-island mate exists. Offered mutations cover prompt emphasis, strategy, temperature, output allowance and optional tools.
+Rule mating preserves the parent's own prompt, adds the mate's reading emphasis as the one added paragraph, takes the mate's strategy, averages temperatures and combines tools before offering one seeded field mutation. Plain mutation applies when no cross-island mate exists. Offered mutations cover prompt emphasis, strategy, temperature, output allowance and optional tools.
 
-The same seed must repeat the chosen child. Existing content is excluded. Effective research-method instructions participate in novelty, while source metadata alone does not establish novelty. A child retains its actual parents' combined methods and source provenance through mutation and persistence; island defaults cannot replace inherited methods. The genome is validated before specification changes.
+The same seed must repeat the chosen child. Existing content is excluded. Effective research-method instructions participate in novelty, while source metadata alone does not establish novelty. A child retains its island parent's methods and source provenance through mutation and persistence; island defaults cannot replace inherited methods. The genome is validated before specification changes.
 
-The repeatability test validates deterministic mating and exhausts mutation offers to obtain no child. Tests in `tests/beta/test_methods.py` verify inherited parent methods, novelty independent of source metadata alone, distinct literal whitespace as a real behavioral difference, and refusal of oversized crossed content.
+The repeatability test validates deterministic mating and exhausts mutation offers to obtain no child. Tests in `tests/beta/test_methods.py` verify inherited parent methods, one added paragraph through chained mating, novelty independent of source metadata alone, distinct literal whitespace as a real behavioral difference, and refusal of oversized crossed content.
 
 <a id="tdd-6.2.10"></a>
 
@@ -1203,9 +1207,9 @@ The repeatability test validates deterministic mating and exhausts mutation offe
 
 Retirement candidates must exclude new-child parents and readers whose frozen cohort lacks a completed keep vote. Cohort size uses the first run's stored limits with current planned size as fallback. Selected, released or decided papers do not retain protection.
 
-A proposed retirement applies only to an eligible active nonparent. Adding a child above the population cap archives the least-completed-run eligible genome. If every retiree is protected, the cycle records `pending_reading_cohort` and leaves population unchanged. Archived genomes remain stored with `active=False`.
+A proposed retirement applies only to an eligible active nonparent. Adding a child above the population cap archives, among eligible genomes with at least `runs_threshold` completed runs, the one with the fewest like points and most runs. If every retiree is protected, the cycle records `pending_reading_cohort`; if none of the eligible has been evaluated, `population_unevaluated`; either leaves population unchanged. Archived genomes remain stored with `active=False`.
 
-Tests keep failed readers until cohorts finish, defer children when all retirees have missing votes, and retire completed readers instead of readers that still owe a vote.
+Tests keep failed readers until cohorts finish, defer children when all retirees have missing votes, retire completed readers instead of readers that still owe a vote, and keep a child with one run while an evaluated agent retires.
 
 <a id="tdd-6.2.11"></a>
 
@@ -1214,7 +1218,7 @@ Tests keep failed readers until cohorts finish, defer children when all retirees
 
 Each generation stores `id`, `island_id`, `number`, `status`, `reason`, `revision`, serialized `decisions` and `created_at`, with a unique number per island. Status is `committed` or `skipped`. Decisions contain genome ID, decision and reason plus applicable parent, mutation, island and explanation fields.
 
-Decision outcomes include parent, mate, created, kept and archived. Reasons include `mated`, `from_another_island`, `rule_mating`, `model_mating`, `no_ranking`, `population_cap` and `breeder_lemon`. Cycle skips include `no_active_agent`, `no_novel_child`, `invalid_child` and `pending_reading_cohort`.
+Decision outcomes include parent, mate, created, kept and archived. Reasons include `mated`, `from_another_island`, `rule_mating`, `model_mating`, `no_ranking`, `population_cap` and `breeder_lemon`; a `created` decision also carries `proposal` and `proposal_reason`. Cycle skips include `no_active_agent`, `no_novel_child`, `invalid_child`, `pending_reading_cohort` and `population_unevaluated`.
 
 New genome IDs avoid collisions. Lineage records origin, primary-parent ID/version, parent IDs, generation, mutation, proposer and explanation; `apply_spec` adds revision. Genome changes and generation insertion share the post-proposal transaction. The forced-write-failure test rolls it back and finds neither new revision nor child.
 

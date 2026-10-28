@@ -195,7 +195,7 @@ A paper assignment must choose one or more islands from metadata, current focus,
 Cross-island transfer must copy behavior through genome lineage rather than shared mutable prompts.
 <!-- id: SDD-IS-05 | tdd: TDD-3.1.5, TDD-3.2.10, TDD-3.2.11 | status: pending -->
 
-- Behavior: When evolution borrows behavior from another island, the system creates a child genome that cites the source island, source genome and copied field set. Breeding combines the actual parents' research-method instructions and source provenance; mutation retains inherited methods. Shared instructions occur once, and island defaults cannot replace inherited methods. The child genome lineage shows the cross-island transfer. A failed transfer leaves all existing mutable prompts unchanged.
+- Behavior: When evolution borrows behavior from another island, the system creates a child genome that cites the source island, source genome and copied field set. The child keeps its island parent's own instructions and research methods and takes from the mate one emphasis paragraph, its reading strategy, half its temperature and its tools, so a chained lineage never piles up ancestors' paragraphs or another island's domain methods; mutation retains inherited methods, and island defaults cannot replace them. The child genome lineage shows the cross-island transfer. A failed transfer leaves all existing mutable prompts unchanged.
 
 - Contracts: [TDD-3.1.5](TDD.md#tdd-3.1.5), [TDD-3.2.10](TDD.md#tdd-3.2.10), [TDD-3.2.11](TDD.md#tdd-3.2.11).
 
@@ -225,7 +225,7 @@ The atomic work unit must be one agent run reading one paper under one genome.
 The harness must expose a bounded tool set for paper text, related papers, note capture, feedback context, cost state and final submission.
 <!-- id: SDD-RN-02 | tdd: TDD-4.1.2, TDD-4.2.4, TDD-4.2.5, TDD-4.2.6 | status: pending -->
 
-- Behavior: When an agent run starts, the harness builds allowed tool schemas from the genome and refuses calls outside that set. The run page lists allowed tools and each attempted tool call. An undeclared tool call is refused and recorded without a side effect.
+- Behavior: When an agent run starts, the harness builds allowed tool schemas from the genome and refuses calls outside that set. The run text and the submission schema tell the agent, whatever its prompt says, that the submitted summary is for someone who knows nothing about the field while the claims, objections and idea seeds keep the full scientific detail. The run page lists allowed tools and each attempted tool call. An undeclared tool call is refused and recorded without a side effect.
 
 - Contracts: [TDD-4.1.2](TDD.md#tdd-4.1.2), [TDD-4.2.4](TDD.md#tdd-4.2.4), [TDD-4.2.5](TDD.md#tdd-4.2.5), [TDD-4.2.6](TDD.md#tdd-4.2.6).
 
@@ -338,7 +338,7 @@ Evolution must use cost only as a tie-breaker unless a genome exceeds a configur
 
 - Tests: [tests/beta/test_evolution.py](tests/beta/test_evolution.py).
 
-- Gap: Selection uses likes, completed-run counts and IDs. It has no usefulness bands, cost tie-break, per-genome budget exclusion or separately recorded comparison measures. Paid-proposal caps control requesting a proposal, not candidate spending. Useful-expensive versus cheap-poor and over-budget-candidate tests are absent.
+- Gap: Selection turns the parent among evaluated agents by waiting time, likes, completed runs and age, and retires the evaluated agent with the fewest likes and most runs. It has no usefulness bands, cost tie-break, per-genome budget exclusion or separately recorded comparison measures. Paid-proposal caps control requesting a proposal, not candidate spending. Useful-expensive versus cheap-poor and over-budget-candidate tests are absent.
 
 ## CT-04 Cost rollup ledger
 

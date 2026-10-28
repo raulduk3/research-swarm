@@ -7,10 +7,15 @@ model proposes the child from the whole swarm's state when a provider is
 configured and the budget admits the call; otherwise a seeded rule does the
 mating, so a cycle always produces something and a test can repeat it.
 
-People shape the population two ways only: by archiving agents (switching
-them off) and by letting go of papers. When an island is over its cap, the
-agent with the fewest runs that is not a parent of the new child is archived,
-so the population keeps turning over toward new things.
+The parent turns: the island's agents take it in the order of who has waited
+longest since last being a parent, the liked ones first among equals, and an
+agent that has not yet completed a threshold's worth of runs waits until it
+has been read. People shape the population two ways only: by archiving
+agents (switching them off) and by letting go of papers. When an island is
+over its cap, the evaluated agent with the fewest points that has had the
+most runs, and is not a parent of the new child, is archived, so the old
+turns over toward the new and a child keeps its place until it has been
+evaluated.
 
 A generation is one spec revision together with its record, so it appears
 whole or not at all, and shows on the island page with each decision.
@@ -23,6 +28,7 @@ import json
 import random
 import sqlite3
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -43,7 +49,6 @@ from research_agent.beta.models import ModelCallFailed, ModelClient
 from research_agent.beta.methods import (
     instruction_key,
     island_methods,
-    mix_methods,
     unique_instructions,
 )
 from research_agent.beta.spec import (
@@ -57,19 +62,19 @@ from research_agent.beta.spec import (
 )
 
 EMPHASES = (
-    "Weigh the method before the result.",
-    "Look first for what the evidence does not show.",
-    "Name the single claim the paper cannot do without.",
-    "Prefer what a practitioner could use this month.",
-    "Ask what earlier work this quietly depends on.",
+    "Start from the question a newcomer would ask first.",
+    "Use one everyday analogy, and say where it stops holding.",
+    "Define every technical term the first time it appears, or avoid it.",
+    "Say in one plain sentence why this result matters to anyone.",
+    "Name what a reader should be careful not to conclude from this paper.",
 )
 STRATEGIES = (
-    "Read the stored text first, capture a note on the central claim, look for"
-    " related stored papers, then submit the reading.",
-    "Look for related stored papers before reading, then read the stored text"
-    " against them and submit the reading.",
-    "Read the stored text once, write the objections as notes first, then the"
-    " claims, then submit the reading.",
+    "Read the abstract and the passage that holds the main result, capture a"
+    " note that says the claim in plain words, then submit the reading.",
+    "Look for related stored papers first to see where this one sits, then read"
+    " the stored text against them and submit the reading.",
+    "Read the stored text once, write the plain explanation as notes first, then"
+    " the cautions, then submit the reading.",
 )
 OPTIONAL_TOOLS = ("related_papers", "capture_note", "feedback_context", "cost_state")
 _EMPHASIS = "\n\nEmphasis: "
@@ -94,8 +99,9 @@ PROPOSE_TOOL: Json = {
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Complete research instructions only. Do not include parent ids,"
-                    " source attribution or inherited-from labels; put origins in parents and why.",
+                    "description": "Complete reading instructions only, aimed at explaining the"
+                    " paper so anyone can understand it. Do not include parent ids, source"
+                    " attribution or inherited-from labels; put origins in parents and why.",
                 },
                 "reading_strategy": {"type": "string"},
                 "temperature": {"type": "number"},
@@ -115,18 +121,22 @@ PROPOSE_TOOL: Json = {
 }
 
 _SYSTEM = (
-    "You breed reading agents for a swarm that reads new arXiv papers. Each"
-    " agent is a prompt, a reading strategy, a temperature, an output budget and"
-    " a set of tools. There is no score to optimize: the point is variety that"
-    " reads papers in ways the swarm has not tried, built from what works in"
-    " other agents, on this island and across the others. Mate two or more"
-    " agents, keep what is distinctive in each, change one thing, and keep the"
-    " prompt under 900 characters. People give likes; an agent's points are the"
-    " likes on its work and on papers it voted to keep, and they tell you what"
-    " people enjoyed, not what is right. If one of the island's agents is plainly"
-    " a lemon, name it in archive with a reason. Answer only by calling"
-    " propose_child. Write only reading instructions in the child prompt; do not"
-    " name its parents, sources or the origin of an inherited instruction."
+    "You breed reading agents for a swarm that reads new arXiv papers and"
+    " explains each one so that anyone can understand it. Each agent is a"
+    " prompt, a reading strategy, a temperature, an output budget and a set of"
+    " tools. There is no score to optimize: the point is variety in how papers"
+    " are taught, plain ways of explaining the swarm has not tried, built from"
+    " what works in other agents, on this island and across the others. Mate"
+    " two or more agents, keep what is distinctive in each, change one thing,"
+    " and keep the prompt under 900 characters. A child's prompt tells it to"
+    " say in plain words what problem the paper tackles, what was done, what was"
+    " found and why it matters, with no term left undefined. People give likes;"
+    " an agent's points are the likes on its work and on papers it voted to"
+    " keep, and they tell you what people found clear, not what is right. If one"
+    " of the island's agents is plainly a lemon, name it in archive with a"
+    " reason. Answer only by calling propose_child. Write only reading"
+    " instructions in the child prompt; do not name its parents, sources or the"
+    " origin of an inherited instruction."
 )
 
 
@@ -261,6 +271,23 @@ def mutate_genome(
     return None
 
 
+_BENT = "\n\nAdditional reading emphasis: "
+
+
+def _own(prompt: str) -> str:
+    """An agent's own instructions: its prompt without what breeding added.
+
+    Breeding adds at most one emphasis paragraph and one emphasis line, so a
+    child of a child does not pile its ancestors' paragraphs up.
+    """
+    core = prompt.split(_EMPHASIS)[0]
+    return "\n\n".join(
+        paragraph
+        for paragraph in core.split("\n\n")
+        if not paragraph.startswith(_BENT.strip())
+    ).strip()
+
+
 def _bent(prompt: str) -> str:
     """The part of a prompt after its first sentence: what makes the agent itself."""
     head, _, rest = prompt.partition(". ")
@@ -275,22 +302,21 @@ def mate_genomes(
 ) -> tuple[Json, Json] | None:
     """Cross two agents by rule, then change one thing.
 
-    The child keeps the parent's prompt and takes the mate's bent as a second
-    paragraph, the mate's reading strategy, the mean temperature and the
-    union of tools. The same seed gives the same child; ``None`` when every
-    offered change repeats an agent already on the island.
+    The child keeps the parent's own instructions and research methods, and
+    takes the mate's bent as its one added paragraph, the mate's reading
+    strategy, the mean temperature and the union of tools. The same seed
+    gives the same child; ``None`` when every offered change repeats an agent
+    already on the island.
     """
-    base = str(parent["prompt"]).split(_EMPHASIS)[0]
-    bent = _bent(str(mate["prompt"]).split(_EMPHASIS)[0])
+    base = _own(str(parent["prompt"]))
+    bent = _bent(_own(str(mate["prompt"])))
     mean = (
         float(parent["model_settings"]["temperature"])
         + float(mate["model_settings"]["temperature"])
     ) / 2
     crossed: Json = {
-        "prompt": unique_instructions(f"{base}\n\nAdditional reading emphasis: {bent}"),
-        "research_methods": mix_methods(
-            [parent.get("research_methods", {}), mate.get("research_methods", {})]
-        ),
+        "prompt": unique_instructions(f"{base}{_BENT}{bent}"),
+        "research_methods": copy.deepcopy(parent.get("research_methods", {})),
         "model_settings": {**parent["model_settings"], "temperature": round(mean, 2)},
         "allowed_tools": sorted(
             set(parent["allowed_tools"]) | set(mate["allowed_tools"])
@@ -310,6 +336,72 @@ def _runs_of(db: sqlite3.Connection, genome_id: str) -> int:
             "SELECT COUNT(*) FROM runs WHERE genome_id = ? AND status = 'completed'",
             (genome_id,),
         ).fetchone()[0]
+    )
+
+
+@dataclass(frozen=True)
+class Standing:
+    """What the island knows about one of its agents when it breeds."""
+
+    runs: int
+    points: int
+    #: The last generation that bred from it; 0 when it never was a parent.
+    last_parent: int
+    #: Whether it has completed a threshold's worth of runs: been read.
+    evaluated: bool
+
+
+def _standings(
+    db: sqlite3.Connection,
+    island_id: str,
+    agents: Sequence[Mapping[str, Any]],
+    threshold: int,
+) -> dict[str, Standing]:
+    last: dict[str, int] = {}
+    for number, decisions in db.execute(
+        "SELECT number, decisions FROM generations WHERE island_id = ?"
+        " AND status = 'committed'",
+        (island_id,),
+    ):
+        for decision in loads(decisions):
+            if decision.get("decision") == "parent":
+                last[str(decision["genome_id"])] = max(
+                    last.get(str(decision["genome_id"]), 0), int(number)
+                )
+    standings: dict[str, Standing] = {}
+    for agent in agents:
+        genome_id = str(agent["id"])
+        runs = _runs_of(db, genome_id)
+        standings[genome_id] = Standing(
+            runs=runs,
+            points=points_of(db, genome_id),
+            last_parent=last.get(genome_id, 0),
+            evaluated=runs >= threshold,
+        )
+    return standings
+
+
+def _next_parent(
+    active: Sequence[Mapping[str, Any]], standing: Mapping[str, Standing]
+) -> Mapping[str, Any]:
+    """Whose turn it is: the evaluated agent that has waited longest.
+
+    Among those, the liked come first, then the experienced, then the older.
+    When no agent has been evaluated, those with any completed run take the
+    turn; when none has, every active agent does.
+    """
+    evaluated = [g for g in active if standing[str(g["id"])].evaluated]
+    read = [g for g in active if standing[str(g["id"])].runs]
+    pool = evaluated or read or list(active)
+    age = {str(g["id"]): index for index, g in enumerate(active)}
+    return min(
+        pool,
+        key=lambda g: (
+            standing[str(g["id"])].last_parent,
+            -standing[str(g["id"])].points,
+            -standing[str(g["id"])].runs,
+            age[str(g["id"])],
+        ),
     )
 
 
@@ -428,12 +520,7 @@ def _proposal_from_model(
         return None, {"model": "malformed_proposal", "cost_micros": amount}
     content: Json = {
         "prompt": str(arguments.get("prompt", ""))[:1800],
-        "research_methods": mix_methods(
-            [
-                known[parent_id].get("research_methods", {})
-                for parent_id in dict.fromkeys(parents)
-            ]
-        )
+        "research_methods": copy.deepcopy(first.get("research_methods"))
         or island_methods(island),
         "model_settings": {
             "temperature": round(min(1.2, max(0.1, temperature)), 2),
@@ -586,17 +673,10 @@ def maybe_run_evolution(
     if not active:
         record["reason"] = "no_active_agent"
         return close()
-    # The parent is the island's most liked agent, then its most experienced; the
-    # mate comes from another island, chosen by the generation's seed so the
-    # pairing repeats.
-    parent = max(
-        active,
-        key=lambda g: (
-            points_of(db, str(g["id"])),
-            _runs_of(db, str(g["id"])),
-            str(g["id"]),
-        ),
-    )
+    standing = _standings(db, island_id, active, settings.runs_threshold)
+    parent = _next_parent(active, standing)
+    # The mate comes from another island, chosen by the generation's seed so
+    # the pairing repeats.
     rng = random.Random(f"{island_id}:{number}")
     elsewhere = [
         (str(other["id"]), g)
@@ -610,6 +690,7 @@ def maybe_run_evolution(
     child: Json | None = None
     how: Json = {}
     if island["mutate"]:
+        how = {"model": "not_asked"}
         if provider is not None and client is not None:
             state = budget_state(db, spec, now, True)
             child, how = _proposal_from_model(
@@ -679,8 +760,20 @@ def maybe_run_evolution(
         if not candidates:
             record["reason"] = "pending_reading_cohort"
             return close()
+        evaluated = [g for g in candidates if standing[str(g["id"])].evaluated]
+        if not evaluated:
+            record["reason"] = "population_unevaluated"
+            return close()
+        # The agent that has had the most chances and earned the fewest likes,
+        # the older first among equals.
+        age = {str(g["id"]): index for index, g in enumerate(active)}
         victim = min(
-            candidates, key=lambda g: (_runs_of(db, str(g["id"])), str(g["id"]))
+            evaluated,
+            key=lambda g: (
+                standing[str(g["id"])].points,
+                -standing[str(g["id"])].runs,
+                age[str(g["id"])],
+            ),
         )
         archived = str(victim["id"])
 
@@ -746,6 +839,8 @@ def maybe_run_evolution(
             parents=parents,
             mutation=how.get("rule"),
             why=how.get("why"),
+            proposal=how.get("model"),
+            proposal_reason=how.get("reason"),
         )
     record.update(
         status="committed", revision=applied["revision"] if applied["applied"] else None
