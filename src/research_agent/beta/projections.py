@@ -98,6 +98,57 @@ def _text(value: Any) -> str:
     return value if isinstance(value, str) else json.dumps(value)
 
 
+def _cut_mark(record: Mapping[str, Any], key: str) -> str:
+    """The visible mark a stored text carries when it was cut at the limit."""
+    whole = record.get(f"{key}_truncated_from")
+    if whole is None:
+        return ""
+    return f"\n[cut at {len(str(record.get(key) or ''))} of {whole} characters]"
+
+
+def _tool_call_text(call: Mapping[str, Any]) -> str:
+    """One tool call as the model wrote it: ``[tool call name (id)]`` then its arguments."""
+    arguments = call.get("arguments")
+    lines = [f"[tool call {call.get('name')} ({call.get('id')})]"]
+    if arguments is not None:
+        lines.append(f"{arguments}{_cut_mark(call, 'arguments')}")
+    return "\n".join(lines)
+
+
+def _message_text(message: Mapping[str, Any]) -> str:
+    """One message verbatim: a role line, the content, then any tool calls."""
+    role = str(message.get("role"))
+    if message.get("tool_call_id"):
+        role = f"{role} ({message['tool_call_id']})"
+    parts = [f"[{role}]"]
+    if message.get("content") is not None:
+        parts.append(f"{message['content']}{_cut_mark(message, 'content')}")
+    parts.extend(_tool_call_text(call) for call in message.get("tool_calls") or [])
+    return "\n".join(parts)
+
+
+def _model_input(payload: Mapping[str, Any]) -> str | None:
+    """Exactly the messages the call sent, in order, each verbatim."""
+    messages = payload.get("messages")
+    if messages is None:
+        # An event stored before messages were kept: only the notice is known.
+        return payload.get("harness_notice")
+    return "\n\n".join(_message_text(message) for message in messages)
+
+
+def _model_output(payload: Mapping[str, Any]) -> str:
+    """Exactly the reply: its text, its reasoning and each tool call with arguments."""
+    parts: list[str] = []
+    if payload.get("text"):
+        parts.append(f"{payload['text']}{_cut_mark(payload, 'text')}")
+    if payload.get("reasoning"):
+        parts.append(
+            f"[reasoning]\n{payload['reasoning']}{_cut_mark(payload, 'reasoning')}"
+        )
+    parts.extend(_tool_call_text(call) for call in payload.get("tool_calls") or [])
+    return "\n\n".join(parts)
+
+
 def _display(kind: str, payload: Mapping[str, Any]) -> Json:
     """How a step reads on the replay: a line, and what went in and came out.
 
@@ -122,7 +173,7 @@ def _display(kind: str, payload: Mapping[str, Any]) -> Json:
         shown["input"] = f"{payload['system']}\n\n{payload['user']}"
     elif kind == "model_call":
         shown["model"] = payload.get("model")
-        shown["input"] = payload.get("harness_notice")
+        shown["input"] = _model_input(payload)
         if "error" in payload:
             shown["body"] = f"Model call {payload['index']} failed: {payload['error']}"
         else:
@@ -130,8 +181,7 @@ def _display(kind: str, payload: Mapping[str, Any]) -> Json:
                 f"Model call {payload['index']}: {payload['input_tokens']} tokens in,"
                 f" {payload['output_tokens']} out"
             )
-            asked = ", ".join(call["name"] for call in payload["tool_calls"])
-            shown["output"] = payload["text"] or (f"asked for {asked}" if asked else "")
+            shown["output"] = _model_output(payload)
     elif kind == "tool_call":
         shown["tool"] = payload["name"]
         shown["input"] = _text(payload["arguments"])

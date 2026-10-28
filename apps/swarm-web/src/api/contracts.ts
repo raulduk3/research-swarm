@@ -192,6 +192,40 @@ export const readingSchema = z.object({
   created_at: z.number(),
 });
 
+/** A tool call as the model wrote it: its id, name and the argument text it sent. */
+export const modelToolCallSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  arguments: z.string().optional().nullable(),
+  arguments_truncated_from: z.number().int().positive().optional().nullable(),
+});
+
+/** One message as it went to the model; a `*_truncated_from` count marks a text cut at the limit. */
+export const modelMessageSchema = z.object({
+  role: z.string(),
+  content: z.string().optional().nullable(),
+  content_truncated_from: z.number().int().positive().optional().nullable(),
+  tool_call_id: z.string().optional().nullable(),
+  tool_calls: z.array(modelToolCallSchema).optional().nullable(),
+});
+
+/** The stored record of one model call: the messages added since the previous call, and the whole reply. */
+export const modelCallPayloadSchema = z.object({
+  index: z.number().int().positive(),
+  messages: z.array(modelMessageSchema).optional().nullable(),
+  harness_notice: z.string().optional().nullable(),
+  error: z.string().optional().nullable(),
+  model: z.string().optional().nullable(),
+  text: z.string().optional().nullable(),
+  text_truncated_from: z.number().int().positive().optional().nullable(),
+  reasoning: z.string().optional().nullable(),
+  reasoning_truncated_from: z.number().int().positive().optional().nullable(),
+  tool_calls: z.array(modelToolCallSchema).optional().nullable(),
+  input_tokens: z.number().int().nonnegative().optional().nullable(),
+  output_tokens: z.number().int().nonnegative().optional().nullable(),
+  finish_reason: z.string().optional().nullable(),
+});
+
 export const runEventSchema = z.object({
   id: z.number(),
   run_id: z.string(),
@@ -205,6 +239,10 @@ export const runEventSchema = z.object({
   output: z.string().optional().nullable(),
   payload: z.unknown().optional(),
   locator: locatorSchema.optional().nullable(),
+}).superRefine((event, ctx) => {
+  if (event.kind !== "model_call" || event.payload === undefined) return;
+  const result = modelCallPayloadSchema.safeParse(event.payload);
+  for (const issue of result.success ? [] : result.error.issues) ctx.addIssue({ ...issue, path: ["payload", ...issue.path] });
 });
 
 export const evolutionStepSchema = z.object({

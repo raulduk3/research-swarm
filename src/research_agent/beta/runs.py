@@ -1044,6 +1044,36 @@ def _bounded(value: Any) -> Any:
     return value if len(text) <= RESULT_LIMIT else {"truncated": text[:RESULT_LIMIT]}
 
 
+def _clipped(record: dict[str, Any], key: str, text: str | None) -> None:
+    """Keep ``text`` under ``key`` whole, or cut at the limit with its full length
+    kept beside it, so a cut is visible rather than silent."""
+    record[key] = text
+    if text is not None and len(text) > RESULT_LIMIT:
+        record[key] = text[:RESULT_LIMIT]
+        record[f"{key}_truncated_from"] = len(text)
+
+
+def _recorded_tool_call(call: Mapping[str, Any]) -> Json:
+    """A tool call as the model wrote it: its id, name and argument text."""
+    record: dict[str, Any] = {"id": call["id"], "name": call["name"]}
+    _clipped(record, "arguments", str(call["arguments"]))
+    return record
+
+
+def _recorded_message(message: Mapping[str, Any]) -> Json:
+    """A message as it was sent to the model, with each text kept whole or marked cut."""
+    record: dict[str, Any] = {"role": message["role"]}
+    _clipped(record, "content", message.get("content"))
+    if "tool_call_id" in message:
+        record["tool_call_id"] = message["tool_call_id"]
+    if message.get("tool_calls"):
+        record["tool_calls"] = [
+            _recorded_tool_call({**call["function"], "id": call["id"]})
+            for call in message["tool_calls"]
+        ]
+    return record
+
+
 def _passage_locator(paper_id: str, passage: Mapping[str, Any]) -> Locator:
     return Locator(
         paper_id=paper_id,
@@ -1580,6 +1610,9 @@ def _drive(ctx: _Context, client: ModelClient) -> None:
     grown = False
     # The run has spent its cost allowance; its next call is its last.
     over_cost = False
+    # How many messages earlier model-call events already hold; each event
+    # records exactly the messages added since, so the trace shows every input.
+    recorded = 0
     index = 0
     while index < calls_allowed:
         index += 1
@@ -1614,6 +1647,8 @@ def _drive(ctx: _Context, client: ModelClient) -> None:
         output_tokens = submit_tokens if submitting else step_tokens
         if grown:
             output_tokens = banded(output_tokens, band)
+        given = [_recorded_message(message) for message in messages[recorded:]]
+        recorded = len(messages)
         began = time.monotonic()
         try:
             response = client.complete(
@@ -1638,7 +1673,12 @@ def _drive(ctx: _Context, client: ModelClient) -> None:
             ctx.db.commit()
             ctx.event(
                 "model_call",
-                {"index": index, "error": str(failure), "harness_notice": notice},
+                {
+                    "index": index,
+                    "error": str(failure),
+                    "harness_notice": notice,
+                    "messages": given,
+                },
                 receipt_id=receipt_id,
                 cost_state="unsettled",
             )
@@ -1656,27 +1696,29 @@ def _drive(ctx: _Context, client: ModelClient) -> None:
             **common,
         )
         ctx.db.commit()
-        ctx.event(
-            "model_call",
-            {
-                "index": index,
-                "model": response.model,
-                "input_tokens": response.input_tokens,
-                "output_tokens": response.output_tokens,
-                "usage_reported": response.usage_reported,
-                "finish_reason": response.finish_reason,
-                "text": response.text[:RESULT_LIMIT],
-                "reasoning": response.reasoning[:RESULT_LIMIT],
-                "tool_calls": [
-                    {"id": call.id, "name": call.name} for call in response.tool_calls
-                ],
-                "offered_tools": offered,
-                "harness_notice": notice,
-                "latency_ms": int((time.monotonic() - began) * 1000),
-            },
-            receipt_id=receipt_id,
-            cost_state="settled",
-        )
+        # The whole exchange: what was sent since the last call, and the reply
+        # as the model wrote it, each tool call with its argument text.
+        exchange: dict[str, Any] = {
+            "index": index,
+            "model": response.model,
+            "input_tokens": response.input_tokens,
+            "output_tokens": response.output_tokens,
+            "usage_reported": response.usage_reported,
+            "finish_reason": response.finish_reason,
+            "messages": given,
+            "tool_calls": [
+                _recorded_tool_call(
+                    {"id": call.id, "name": call.name, "arguments": call.raw_arguments}
+                )
+                for call in response.tool_calls
+            ],
+            "offered_tools": offered,
+            "harness_notice": notice,
+            "latency_ms": int((time.monotonic() - began) * 1000),
+        }
+        _clipped(exchange, "text", response.text)
+        _clipped(exchange, "reasoning", response.reasoning)
+        ctx.event("model_call", exchange, receipt_id=receipt_id, cost_state="settled")
         messages.append(assistant_message(response))
         notice = None if response.tool_calls else NO_TOOL_NOTICE
         if response.finish_reason == "length":
