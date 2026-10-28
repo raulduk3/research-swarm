@@ -207,20 +207,8 @@ def instruction_key(text: str) -> tuple[tuple[str, str], ...]:
     return tuple(parts)
 
 
-def unique_instructions(text: str) -> str:
-    """Keep the first copy of exact instruction units, including wrapped text."""
-    protected = [match.span() for match in _PROTECTED_LITERAL.finditer(text)]
-    duplicate_lines = [
-        match.span()
-        for match in re.finditer(r"(?m)^([^\n]+)\n(?=\1(?:\n|$))", text)
-        if not any(
-            first < match.end() and match.start() < last for first, last in protected
-        )
-    ]
-    if duplicate_lines:
-        for first, last in reversed(duplicate_lines):
-            text = text[:first] + text[last:]
-        return unique_instructions(text)
+def _units(text: str, protected: Sequence[tuple[int, int]]) -> list[tuple[str, str]]:
+    """The text as instruction units, each with the separator that followed it."""
     units: list[tuple[str, str]] = []
     start = 0
     for match in _INSTRUCTION_BREAK.finditer(text):
@@ -238,6 +226,36 @@ def unique_instructions(text: str) -> str:
         units.append((unit, match.group(group)))
         start = match.end()
     units.append((text[start:], ""))
+    return units
+
+
+def instruction_units(text: str) -> list[tuple[str, str]]:
+    """The sentences, bullets and paragraphs of a text, with what follows each.
+
+    Joining every unit with its separator gives the text back, so an edit that
+    replaces, removes or appends one unit leaves the rest byte for byte.
+    """
+    protected = [match.span() for match in _PROTECTED_LITERAL.finditer(text)]
+    return [
+        (unit, separator) for unit, separator in _units(text, protected) if unit.strip()
+    ]
+
+
+def unique_instructions(text: str) -> str:
+    """Keep the first copy of exact instruction units, including wrapped text."""
+    protected = [match.span() for match in _PROTECTED_LITERAL.finditer(text)]
+    duplicate_lines = [
+        match.span()
+        for match in re.finditer(r"(?m)^([^\n]+)\n(?=\1(?:\n|$))", text)
+        if not any(
+            first < match.end() and match.start() < last for first, last in protected
+        )
+    ]
+    if duplicate_lines:
+        for first, last in reversed(duplicate_lines):
+            text = text[:first] + text[last:]
+        return unique_instructions(text)
+    units = _units(text, protected)
     seen: set[tuple[tuple[str, str], ...]] = set()
     kept: list[tuple[str, str]] = []
     for unit, separator in units:

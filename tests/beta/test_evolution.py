@@ -102,6 +102,22 @@ def _cycle(db: sqlite3.Connection, clock: FakeClock, **kwargs: Any):
     return evolution.maybe_run_evolution(db, "cs", clock(), **kwargs)
 
 
+def _proposal(db: sqlite3.Connection, genome_id: str, **changes: Any) -> dict[str, Any]:
+    """A propose_child call that edits one agent: its content plus the changes."""
+    _, spec = specs.current_spec(db)
+    genome = specs.find_genome(spec, genome_id)[1]
+    return {
+        "parents": [genome_id],
+        "prompt": genome["prompt"],
+        "reading_strategy": genome["reading_strategy"],
+        "temperature": genome["model_settings"]["temperature"],
+        "max_output_tokens": genome["model_settings"]["max_output_tokens"],
+        "allowed_tools": list(genome["allowed_tools"]),
+        "why": "one step",
+        **changes,
+    }
+
+
 def _content(genome: dict[str, Any]) -> dict[str, Any]:
     return {name: genome[name] for name in specs.GENOME_CONTENT}
 
@@ -197,9 +213,12 @@ def test_the_run_threshold_breeds_a_child_from_the_island_and_another(
     assert bred["lineage"]["parents"] == ["cs-reader", mate["id"]]
     assert bred["lineage"]["proposed_by"] == "rule"
     assert (bred["lineage"]["generation"], bred["lineage"]["revision"]) == (1, 2)
-    assert bred["prompt"].startswith(parent["prompt"].split("\n\n")[0])
+    # The child is the parent changed in exactly one place, with the change
+    # taken from the mate.
+    assert len(evolution.changes(parent, bred)) == 1
+    assert bred["lineage"]["mutation"]["source"] == "mate"
+    assert bred["lineage"]["mutation"]["crossed_with"] == mate["id"]
     assert mate["id"] not in bred["prompt"]
-    assert "Additional reading emphasis:" in bred["prompt"]
     assert bred["active"] and parent["version"] == 1
     assert specs.get_revision(db, 2)["actor"] == "evolution"
     # The counters start again from this generation.
@@ -234,22 +253,12 @@ def test_the_model_proposes_the_child_when_it_is_configured(
 ) -> None:
     for _ in range(6):
         _run(db, clock, "cs-reader")
-    client = ScriptedClient(
-        [
-            reply(
-                call(
-                    "propose_child",
-                    {
-                        "parents": ["cs-reader", "bio-builder"],
-                        "prompt": "Read for the central result, then simulate it forward.",
-                        "reading_strategy": "Read the result, chain its consequences, submit.",
-                        "temperature": 0.75,
-                        "why": "Evidence-first reading with the simulator's forward chaining.",
-                    },
-                )
-            )
-        ]
-    )
+    edited = _proposal(db, "cs-reader")
+    sentence = "Open with the question a curious reader would ask first."
+    edited["prompt"] = f"{edited['prompt']} {sentence}"
+    edited["parents"] = ["cs-reader", "bio-builder"]
+    edited["why"] = "Evidence-first reading that opens with the reader's question."
+    client = ScriptedClient([reply(call("propose_child", edited))])
 
     record = _cycle(db, clock, provider=PROVIDER, client=client)
 
@@ -260,19 +269,29 @@ def test_the_model_proposes_the_child_when_it_is_configured(
         ["cs-reader", "bio-builder"],
     )
     assert child["why"].startswith("Evidence-first")
+    assert child["mutation"] == {
+        "field": "prompt",
+        "removed": [],
+        "added": [sentence],
+        "source": "model",
+    }
     _, spec = specs.current_spec(db)
+    parent = specs.find_genome(spec, "cs-reader")[1]
     bred = specs.find_genome(spec, "cs-gen1")[1]
     assert bred["lineage"]["proposed_by"] == "model"
-    assert bred["prompt"].startswith("Read for the central result")
-    assert bred["model_settings"]["temperature"] == 0.75
+    assert bred["prompt"] == f"{parent['prompt']} {sentence}"
+    assert bred["model_settings"] == parent["model_settings"]
     assert "submit_reading" in bred["allowed_tools"]
     assert (child["proposal"], child["proposal_reason"]) == ("proposed", None)
     # The child works its island's methods; the mate's domain stays on its island.
     assert "compare data splits" in bred["research_methods"]["instructions"]
     assert "controlled perturbation" not in bred["research_methods"]["instructions"]
     assert bred["research_methods"]["domain"] == "cs"
-    # The model saw the whole swarm, this island first, and the call was paid for.
+    # The model was told which agent to edit, saw it in full, then the whole
+    # swarm with this island first, and the call was paid for.
     sent = client.requests[0]["messages"][1]["content"]
+    assert "changing exactly one thing about cs-reader" in sent
+    assert parent["prompt"] in sent
     assert sent.index("## CS island") < sent.index("## Bio island")
     assert "bio-builder@bio" in sent
     receipt = db.execute(
@@ -305,25 +324,28 @@ def test_a_failed_or_useless_proposal_falls_back_to_the_rule(
 
     for _ in range(6):
         _run(db, clock, "cs-reader")
-    elsewhere = ScriptedClient(
+    rewrite = ScriptedClient(
         [
             reply(
                 call(
                     "propose_child",
                     {
-                        "parents": ["bio-reader"],
-                        "prompt": "Not this island's.",
-                        "reading_strategy": "x",
+                        "parents": ["cs-reader", "bio-reader"],
+                        "prompt": "A whole new agent. Written from scratch.",
+                        "reading_strategy": "Read it all, then submit.",
                         "temperature": 0.5,
-                        "why": "wrong island",
+                        "why": "a leap, not a step",
                     },
                 )
             )
         ]
     )
-    second = _cycle(db, clock, provider=PROVIDER, client=elsewhere)
-    assert _decisions(second)["cs-gen2"]["reason"] == "rule_mating"
-    assert _decisions(second)["cs-gen2"]["proposal"] == "no_parent_on_island"
+    second = _cycle(db, clock, provider=PROVIDER, client=rewrite)
+    child = _decisions(second)["cs-gen2"]
+    assert child["reason"] == "rule_mating"
+    # A proposal that changes more than one thing is refused, and says what.
+    assert child["proposal"] == "too_many_changes"
+    assert child["proposal_reason"] == "prompt, reading_strategy, temperature"
 
 
 def test_the_budget_decides_whether_the_model_is_asked(
@@ -468,15 +490,15 @@ def test_the_breeder_may_fail_out_a_lemon_and_likes_pick_the_parent(
             reply(
                 call(
                     "propose_child",
-                    {
-                        "parents": ["cs-skeptic", "quant-reader"],
-                        "prompt": "Doubt first, then read for evidence.",
-                        "reading_strategy": "Methods, then results, then submit.",
-                        "temperature": 0.5,
-                        "why": "The skeptic people liked, with the reader's evidence habit.",
-                        "archive": "cs-builder",
-                        "why_archive": "It keeps every paper and quotes nothing.",
-                    },
+                    _proposal(
+                        db,
+                        "cs-reader",
+                        parents=["cs-reader", "quant-reader"],
+                        temperature=0.65,
+                        why="A touch cooler, as the quant reader is.",
+                        archive="cs-builder",
+                        why_archive="It keeps every paper and quotes nothing.",
+                    ),
                 )
             )
         ]
@@ -488,7 +510,8 @@ def test_the_breeder_may_fail_out_a_lemon_and_likes_pick_the_parent(
     assert decisions["cs-builder"]["decision"] == "archived"
     assert decisions["cs-builder"]["reason"] == "breeder_lemon"
     assert decisions["cs-builder"]["why"].startswith("It keeps")
-    assert decisions["cs-gen1"]["parents"] == ["cs-skeptic", "quant-reader"]
+    assert decisions["cs-gen1"]["parents"] == ["cs-reader", "quant-reader"]
+    assert decisions["cs-gen1"]["mutation"]["field"] == "temperature"
     assert "1 points" in client.requests[0]["messages"][1]["content"]
     _, spec = specs.current_spec(db)
     assert specs.find_genome(spec, "cs-builder")[1]["active"] is False
@@ -671,15 +694,15 @@ def test_breeder_keeps_failed_reader_until_its_cohort_finishes(
             reply(
                 call(
                     "propose_child",
-                    {
-                        "parents": ["cs-reader", "quant-reader"],
-                        "prompt": "Read methods carefully before deciding.",
-                        "reading_strategy": "Read methods and limitations, then submit.",
-                        "temperature": 0.5,
-                        "why": "Combine careful evidence habits.",
-                        "archive": "cs-builder",
-                        "why_archive": "Repeated failed submissions.",
-                    },
+                    _proposal(
+                        db,
+                        "cs-reader",
+                        parents=["cs-reader", "quant-reader"],
+                        temperature=0.65,
+                        why="Combine careful evidence habits.",
+                        archive="cs-builder",
+                        why_archive="Repeated failed submissions.",
+                    ),
                 )
             )
         ]
@@ -737,15 +760,15 @@ def test_decided_papers_do_not_prevent_reader_retirement(
             reply(
                 call(
                     "propose_child",
-                    {
-                        "parents": ["cs-reader", "quant-reader"],
-                        "prompt": "Read methods carefully before deciding.",
-                        "reading_strategy": "Read methods and limitations, then submit.",
-                        "temperature": 0.5,
-                        "why": "Combine careful evidence habits.",
-                        "archive": "cs-builder",
-                        "why_archive": "Repeated failed submissions.",
-                    },
+                    _proposal(
+                        db,
+                        "cs-reader",
+                        parents=["cs-reader", "quant-reader"],
+                        temperature=0.65,
+                        why="Combine careful evidence habits.",
+                        archive="cs-builder",
+                        why_archive="Repeated failed submissions.",
+                    ),
                 )
             )
         ]
