@@ -245,6 +245,11 @@ def _with_dropped(units: Units, index: int) -> Units:
     kept = [pair for i, pair in enumerate(units) if i != index]
     if kept and index == len(units) - 1:
         kept[-1] = (kept[-1][0], "")
+    elif index > 0:
+        # A paragraph break the dropped sentence carried stays with the text.
+        before, dropped = units[index - 1][1], units[index][1]
+        if dropped.count("\n") > before.count("\n"):
+            kept[index - 1] = (kept[index - 1][0], dropped)
     return kept
 
 
@@ -260,7 +265,7 @@ def _sentence_offers(
 
     *donors* are (sentence, source) pairs; a donor already in the text is not
     offered. A sentence is added only below *limit*, the first sentence is
-    never swapped or dropped when *first_fixed*, and the last sentence is
+    never swapped or dropped when *first_fixed*, and the only sentence is
     never dropped.
     """
     units = instruction_units(text)
