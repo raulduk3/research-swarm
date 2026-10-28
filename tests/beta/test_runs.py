@@ -42,6 +42,8 @@ from research_agent.beta.runs import (
     COST_NOTICE,
     LAST_CALL_NOTICE,
     NEXT_IS_LAST_NOTICE,
+    NO_TOOL_NOTICE,
+    RESULT_LIMIT,
     RETRY_NOTICE,
     STEP_OUTPUT_TOKENS,
     SUBMIT_OUTPUT_TOKENS,
@@ -161,6 +163,89 @@ def test_a_switched_off_agent_starts_no_run(
 
     with pytest.raises(Conflict, match="genome_inactive"):
         _create(db, clock)
+
+
+def test_each_model_call_records_exactly_what_went_in_and_what_came_back(
+    db: sqlite3.Connection, cfg: BetaConfig, clock: FakeClock
+) -> None:
+    _store(db, clock)
+    run_id = _create(db, clock)
+    long_text = "x" * (RESULT_LIMIT + 400)
+
+    client = _execute(
+        cfg,
+        clock,
+        run_id,
+        [
+            reply(call("paper_text", {})),
+            reply(text=long_text),
+            reply(call("submit_reading", reading())),
+        ],
+    )
+
+    view = build_run_projection(db, run_id)
+    assert view["run"]["status"] == "completed"
+    calls = [e for e in view["events"] if e["kind"] == "model_call"]
+    assert len(calls) == 3
+    # The stored messages of all calls, in order, are the last request the model saw.
+    stored = [m for c in calls for m in c["payload"]["messages"]]
+    sent = client.requests[-1]["messages"]
+    assert [m["role"] for m in stored] == [m["role"] for m in sent]
+    assert [m["content"] for m in stored][:2] == [m["content"] for m in sent][:2]
+    assert view["run"]["prompt"]["user"] == stored[1]["content"]
+
+    # The first call holds the system and user prompt, verbatim.
+    first = calls[0]
+    assert [m["role"] for m in first["payload"]["messages"]] == ["system", "user"]
+    assert first["input"].startswith(f"[system]\n{stored[0]['content']}\n\n[user]\n")
+    assert first["input"].endswith(stored[1]["content"])
+    assert first["payload"]["tool_calls"] == [
+        {"id": "call-paper_text", "name": "paper_text", "arguments": "{}"}
+    ]
+    assert first["output"] == "[tool call paper_text (call-paper_text)]\n{}"
+
+    # The second call holds the assistant turn and the tool result it answered.
+    second = calls[1]
+    assistant, result = second["payload"]["messages"]
+    assert assistant == {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": "call-paper_text", "name": "paper_text", "arguments": "{}"}
+        ],
+    }
+    assert result["role"] == "tool" and result["tool_call_id"] == "call-paper_text"
+    assert result["content"] == sent[3]["content"]
+    assert "paper map only" in result["content"]
+    assert second["input"] == (
+        "[assistant]\n[tool call paper_text (call-paper_text)]\n{}\n\n"
+        f"[tool (call-paper_text)]\n{result['content']}"
+    )
+    # A reply longer than the limit is cut, and the cut is marked with both lengths.
+    assert second["payload"]["text"] == long_text[:RESULT_LIMIT]
+    assert second["payload"]["text_truncated_from"] == len(long_text)
+    assert second["output"] == (
+        f"{long_text[:RESULT_LIMIT]}\n[cut at {RESULT_LIMIT} of {len(long_text)} characters]"
+    )
+
+    # The third call holds that cut answer carried forward and the harness notice.
+    third = calls[2]
+    carried, notice = third["payload"]["messages"]
+    assert carried["role"] == "assistant"
+    assert carried["content"] == long_text[:RESULT_LIMIT]
+    assert carried["content_truncated_from"] == len(long_text)
+    assert notice["role"] == "user"
+    assert notice["content"] == third["payload"]["harness_notice"]
+    assert NO_TOOL_NOTICE in notice["content"]
+    assert third["input"].endswith(f"[user]\n{notice['content']}")
+    assert "truncated" not in notice
+    # The submission's arguments are stored and shown exactly as the model wrote them.
+    submission = third["payload"]["tool_calls"][0]
+    assert submission["name"] == "submit_reading"
+    assert json.loads(submission["arguments"]) == reading()
+    assert third["output"] == (
+        f"[tool call submit_reading (call-submit_reading)]\n{submission['arguments']}"
+    )
 
 
 def test_a_run_records_every_step_in_order_with_receipts_and_locators(
@@ -683,7 +768,10 @@ def test_a_cut_off_submission_gets_one_retry_told_why_and_can_succeed(
     assert client.requests[4]["tools"] == ["submit_reading"]
     retry = [e["payload"] for e in view["events"] if e["kind"] == "model_call"][4]
     assert retry["harness_notice"] == RETRY_NOTICE.format(problem=ARGUMENTS_NOT_JSON)
-    assert "arguments_not_json" not in json.dumps(view["events"])
+    # The cut-off call is answered in the conversation, not recorded as a tool step.
+    tool_steps = [e for e in view["events"] if e["kind"] == "tool_call"]
+    assert "arguments_not_json" not in json.dumps(tool_steps)
+    assert "arguments_not_json" in retry["messages"][-2]["content"]
     assert view["conduct"]["refused_tool_calls"] == []
     # The model was told why its call was refused, not just a code.
     refused = next(

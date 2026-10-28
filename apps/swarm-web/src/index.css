@@ -198,6 +198,24 @@ mark {
 .ask .meta {
   display: block;
 }
+/* A model call shown as the messages it sent and the reply it got, each verbatim. */
+.exchange .msg {
+  margin: 6px 0;
+}
+.exchange .msg + .msg {
+  padding-top: 6px;
+  border-top: 1px dashed var(--line);
+}
+.exchange pre {
+  margin: 2px 0;
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.exchange .cut {
+  color: var(--ink2);
+  font-style: italic;
+}
 .rlog .ev-row {
   display: grid;
   grid-template-columns: 26px minmax(70px, 150px) minmax(0, 1fr) auto;

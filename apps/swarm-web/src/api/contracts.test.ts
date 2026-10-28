@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath, URL as NodeURL } from "node:url";
 import { describe, expect, test } from "vitest";
 import { z } from "zod";
-import { agentEditRequestSchema, chatRequestSchema, genomeRequestSchema, likeRequestSchema, loginRequestSchema, selectionRequestSchema, activitySchema, briefSchema, chatAnswerSchema, errorSchema, islandViewSchema, likeAnswerSchema, loginAnswerSchema, paperViewSchema, publicPaperSchema, revisionAnswerSchema, runViewSchema, selectionAnswerSchema, settingsRequestSchema, stormSchema } from "./contracts.ts";
+import { agentEditRequestSchema, chatRequestSchema, genomeRequestSchema, likeRequestSchema, loginRequestSchema, selectionRequestSchema, activitySchema, modelCallPayloadSchema, briefSchema, chatAnswerSchema, errorSchema, islandViewSchema, likeAnswerSchema, loginAnswerSchema, paperViewSchema, publicPaperSchema, revisionAnswerSchema, runViewSchema, selectionAnswerSchema, settingsRequestSchema, stormSchema } from "./contracts.ts";
 
 const schemas = {
   storm: stormSchema, brief: briefSchema, activity: activitySchema, login: loginAnswerSchema,
@@ -56,6 +56,26 @@ test("the real run response retains its reported cost summary", () => {
   expect(runViewSchema.parse(samples.run).cost).toEqual({
     state: "available", settled_micros: 1000, unsettled_micros: 0, unsettled_count: 0,
   });
+});
+
+test("the real run response records every model call's messages and reply, tool round trip included", () => {
+  const events = runViewSchema.parse(samples.run).events;
+  const calls = events.filter((event) => event.kind === "model_call").map((event) => modelCallPayloadSchema.parse(event.payload));
+  expect(calls.length).toBeGreaterThanOrEqual(2);
+  expect(calls[0]?.messages?.map((message) => message.role)).toEqual(["system", "user"]);
+  expect(calls[0]?.tool_calls?.map((call) => [call.name, call.arguments])).toEqual([["paper_text", "{}"]]);
+  const roundTrip = calls[1]?.messages ?? [];
+  expect(roundTrip.map((message) => message.role)).toEqual(["assistant", "tool"]);
+  expect(roundTrip[0]?.tool_calls?.[0]?.id).toBe(roundTrip[1]?.tool_call_id);
+  expect(roundTrip[1]?.content).toContain("paper map only");
+  expect(calls[1]?.tool_calls?.[0]?.name).toBe("submit_reading");
+  expect(JSON.parse(calls[1]?.tool_calls?.[0]?.arguments ?? "")).toHaveProperty("summary");
+  // The run contract refuses a model call whose messages lost their roles.
+  const run = z.record(z.string(), z.unknown()).parse(samples.run);
+  const broken = (run.events as Record<string, unknown>[]).map((event) =>
+    event.kind === "model_call" ? { ...event, payload: { ...(event.payload as object), messages: [{ content: "?" }] } } : event,
+  );
+  expect(runViewSchema.safeParse({ ...run, events: broken }).success).toBe(false);
 });
 
 test("run cost distinguishes settled charges from unsettled estimates", () => {

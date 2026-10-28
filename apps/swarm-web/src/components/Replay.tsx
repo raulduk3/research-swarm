@@ -143,6 +143,82 @@ function ToolResult({ event }: { event: RunEvent }) {
   return event.output ? <MathText text={event.output} /> : null;
 }
 
+function number(value: Json | undefined): number | null {
+  return typeof value === "number" ? value : null;
+}
+
+/** The mark a stored text carries when the harness cut it at its limit. */
+function Cut({ record, field }: { record: Record<string, Json>; field: string }) {
+  const whole = number(record[`${field}_truncated_from`]);
+  if (whole === null) return null;
+  return <div className="cut">cut at {(string(record[field]) ?? "").length} of {whole} characters</div>;
+}
+
+function ToolCallText({ call }: { call: Record<string, Json> }) {
+  return (
+    <>
+      <pre>[tool call {string(call.name) ?? "?"} ({string(call.id) ?? "?"})]{"\n"}{string(call.arguments) ?? ""}</pre>
+      <Cut record={call} field="arguments" />
+    </>
+  );
+}
+
+/** One message exactly as it went to the model: its role, its content and any tool calls. */
+function MessageBlock({ message }: { message: Record<string, Json> }) {
+  const role = string(message.role) ?? "?";
+  const id = string(message.tool_call_id);
+  return (
+    <div className="msg">
+      <span className="meta">{id ? `${role} (${id})` : role}</span>
+      {typeof message.content === "string" && message.content !== "" && <pre>{message.content}</pre>}
+      <Cut record={message} field="content" />
+      {array(message.tool_calls).map((call, i) => {
+        const row = object(call);
+        return row === null ? null : <ToolCallText key={i} call={row} />;
+      })}
+    </div>
+  );
+}
+
+/** What a model call sent: every message added since the previous call, verbatim. */
+function ModelInput({ event }: { event: RunEvent }) {
+  const messages = array(object(event.payload)?.messages).map(object).filter((m): m is Record<string, Json> => m !== null);
+  if (messages.length === 0) return event.input ? <pre>{event.input}</pre> : null;
+  return (
+    <div className="exchange">
+      {messages.map((message, i) => (
+        <MessageBlock key={i} message={message} />
+      ))}
+    </div>
+  );
+}
+
+/** What a model call got back: the text, the reasoning and each tool call with its arguments. */
+function ModelOutput({ event }: { event: RunEvent }) {
+  const payload = object(event.payload);
+  if (payload === null || !("tool_calls" in payload)) return event.output ? <pre>{event.output}</pre> : null;
+  return (
+    <div className="exchange">
+      <div className="msg">
+        <span className="meta">assistant</span>
+        {string(payload.text) && <pre>{string(payload.text)}</pre>}
+        <Cut record={payload} field="text" />
+        {string(payload.reasoning) && (
+          <>
+            <span className="meta">reasoning</span>
+            <pre>{string(payload.reasoning)}</pre>
+          </>
+        )}
+        <Cut record={payload} field="reasoning" />
+        {array(payload.tool_calls).map((call, i) => {
+          const row = object(call);
+          return row === null ? null : <ToolCallText key={i} call={row} />;
+        })}
+      </div>
+    </div>
+  );
+}
+
 /** The cost of the first `step` events. */
 export function costThrough(events: readonly RunEvent[], step: number): number {
   return events.slice(0, step).reduce((sum, e) => sum + e.cost_micros, 0);
@@ -245,22 +321,42 @@ export function Replay({
                 this step {usd(current.cost_micros)} · so far {usd(costThrough(events, step))}
               </span>
             </div>
-            {current.input ? (
-              <div className="ask">
-                <span className="meta">the agent asked</span>
-                <ToolInput event={current} />
-              </div>
-            ) : null}
-            <div className="said"><MathText text={current.body} /></div>
-            {current.output ? (
+            {current.kind === "model_call" ? (
               <>
-                <ToolResult event={current} />
-                <details>
-                  <summary>raw record</summary>
-                  <pre>{current.output}</pre>
-                </details>
+                {current.input ? (
+                  <div className="ask">
+                    <span className="meta">the model was given</span>
+                    <ModelInput event={current} />
+                  </div>
+                ) : null}
+                <div className="said"><MathText text={current.body} /></div>
+                {current.output ? (
+                  <div className="ask">
+                    <span className="meta">the model replied</span>
+                    <ModelOutput event={current} />
+                  </div>
+                ) : null}
               </>
-            ) : null}
+            ) : (
+              <>
+                {current.input ? (
+                  <div className="ask">
+                    <span className="meta">the agent asked</span>
+                    <ToolInput event={current} />
+                  </div>
+                ) : null}
+                <div className="said"><MathText text={current.body} /></div>
+                {current.output ? (
+                  <>
+                    <ToolResult event={current} />
+                    <details>
+                      <summary>raw record</summary>
+                      <pre>{current.output}</pre>
+                    </details>
+                  </>
+                ) : null}
+              </>
+            )}
           </>
         )}
       </div>
@@ -277,7 +373,7 @@ export function Replay({
             >
               <span className="n">{i + 1}</span>
               <span className="k">{badge(e).label}</span>
-              <span className="t"><MathText text={e.input || e.body} /></span>
+              <span className="t"><MathText text={e.kind === "model_call" ? e.body : e.input || e.body} /></span>
               <span className="c">{usd(e.cost_micros)}</span>
             </button>
           ))}

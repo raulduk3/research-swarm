@@ -603,7 +603,9 @@ Dispatch checks the genome tool policy, records refused attempts and supplies bo
 #### TDD-4.1.3 Run event trace
 <!-- id: TDD-4.1.3 | implements: RN-03 | code: src/research_agent/beta/runs.py#append_run_event | tests: tests/beta/test_runs.py | status: pending -->
 
-Immutable events retain prompt, model attempts, tool calls, notes, final reading and failures. The model boundary converts malformed responses to typed failures, and paid receipts commit before later trace or generation failures can roll them back. Run, chat and evolution regression tests prove receipt durability.
+Immutable events retain prompt, model attempts, tool calls, notes, final reading and failures. Each `model_call` event stores the complete exchange: `messages`, the messages appended to the conversation since the previous call with their role and content (the first call's system and user prompt, later calls' assistant turn, tool results and harness notices), and the reply as the model wrote it (`text`, `reasoning` and each of `tool_calls` with its id, name and argument text). A failed call stores its `messages` and `error`. One text longer than `RESULT_LIMIT` is cut at the limit and its full length kept beside it as `<field>_truncated_from`; nothing is cut otherwise. The run projection renders `input` and `output` from these fields verbatim, one message after another with a role line, and marks every cut with both lengths; it never summarizes a call. The model boundary converts malformed responses to typed failures, and paid receipts commit before later trace or generation failures can roll them back. Run, chat and evolution regression tests prove receipt durability.
+
+`test_each_model_call_records_exactly_what_went_in_and_what_came_back` in `tests/beta/test_runs.py` checks a three-call run with a tool round trip: the stored messages of all calls concatenate to the last request the model saw, the tool result and the submission arguments appear verbatim, and a reply over the limit is cut and marked. The browser's run contract (`modelCallPayloadSchema` in `apps/swarm-web/src/api/contracts.ts`) validates the same payload on the real API answer, and the replay shows each message and the reply on the step.
 
 Normal paper, island and agent run lists exclude failed attempts immediately. Direct diagnostic links remain readable until cleanup. `prune_failed_runs(db, now)` removes failed runs with `finished_at` strictly older than 24 hours and no submitted reading, including events, notes and dependent likes/search records. Startup and heartbeat invoke maintenance. Queued, running and completed runs, and failed runs with readings, remain. Immutable receipts retain run and genome attribution after deletion; agent and island spend remain unchanged.
 
@@ -689,7 +691,7 @@ Malformed JSON arguments for `submit_reading` have a distinct existing path: the
 #### TDD-4.2.5 Bounded text access and final submission offering
 <!-- id: TDD-4.2.5 | implements: RN-02 | code: src/research_agent/beta/runs.py#dispatch_tool_call | tests: tests/beta/test_runs.py | status: implemented -->
 
-The harness must expose only the tool schemas offered for the current call. At the final submission stage it offers `submit_reading` alone and records the harness notice.
+The harness must expose only the tool schemas offered for the current call. At the final submission stage it offers `submit_reading` alone and records the harness notice, both as `harness_notice` and as the user message it became in the call's stored `messages` (TDD-4.1.3).
 
 Paper retrieval returns bounded passage content and produces `paper_read` events for the passages actually returned. Large stored full text can be listed and read by tool rather than included wholesale in the initial prompt.
 

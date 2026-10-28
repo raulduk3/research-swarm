@@ -56,6 +56,24 @@ test("each step shows what the agent asked, its badge and its cost, and only pla
   expect(screen.getByText("this step $0.003 · so far $0.004")).toBeTruthy();
 });
 
+test("a model call step shows every message the model was given and its whole reply", async () => {
+  await openRun(ROUTES, "/runs/R-1?step=3");
+  const given = screen.getByText("the model was given").parentElement as HTMLElement;
+  const blocks = Array.from(given.querySelectorAll(".msg"));
+  expect(blocks.map((b) => b.querySelector(".meta")?.textContent)).toEqual(["assistant", "tool (call-1)", "user"]);
+  expect(blocks[0]?.textContent).toContain("[tool call paper_text (call-1)]\n{}");
+  expect(blocks[1]?.textContent).toContain('{"note": "paper map only"}');
+  expect(blocks[2]?.textContent).toContain("Read the results next.");
+  expect(blocks[2]?.querySelector(".cut")?.textContent).toBe("cut at 22 of 6400 characters");
+  const replied = screen.getByText("the model replied").parentElement as HTMLElement;
+  expect(replied.textContent).toContain("The routing claim rests on one table.");
+  expect(replied.textContent).toContain("reasoningOne benchmark only.");
+  expect(replied.textContent).toContain('[tool call capture_note (call-2)]\n{"text": "Routing halves cost."}');
+  expect(screen.queryByText("raw record")).toBeNull();
+  // The played-steps log names the call, not its messages.
+  expect(within(log() as HTMLElement).getAllByRole("button")[2]?.textContent).toContain("weighed the claim");
+});
+
 test("a step that read a place in the paper moves the viewer to that section and marks the quoted passage", async () => {
   await openRun();
   const next = screen.getByRole("button", { name: "next step" });
