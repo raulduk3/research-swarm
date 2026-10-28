@@ -890,7 +890,7 @@ def test_finished_runs_evolve_an_island_and_the_page_lists_each_decision(
     island = api.http.get("/api/v1/islands/cs", headers=cs).json()
 
     steps = {step["genome_id"]: step for step in island["evolution"]}
-    assert (steps["cs-skeptic"]["decision"], steps["cs-skeptic"]["generation"]) == (
+    assert (steps["cs-reader"]["decision"], steps["cs-reader"]["generation"]) == (
         "parent",
         1,
     )
@@ -898,10 +898,10 @@ def test_finished_runs_evolve_an_island_and_the_page_lists_each_decision(
     addresses = [agent["address"] for agent in island["agents"]]
     assert addresses[0] == "cs-reader@cs" and "cs-gen1@cs" in addresses
     child = api.http.get("/api/v1/agents/cs-gen1", headers=cs).json()["agent"]
-    # Both readers have one run; the deterministic tie picks the skeptic as parent.
+    # Both readers have one run; the deterministic tie picks the reader as parent.
     assert child["lineage"]["origin"] == "mating"
-    assert (child["parent_id"], child["generation"]) == ("cs-skeptic", 1)
-    assert child["lineage"]["parents"][0] == "cs-skeptic"
+    assert (child["parent_id"], child["generation"]) == ("cs-reader", 1)
+    assert child["lineage"]["parents"][0] == "cs-reader"
     assert not child["lineage"]["parents"][1].startswith("cs-")
 
 

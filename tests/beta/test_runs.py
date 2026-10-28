@@ -1814,3 +1814,28 @@ def test_contested_queued_execution_pays_for_one_request(
     assert view["run"]["status"] == "completed"
     assert _kinds(view).count("run_started") == 1
     assert len(client.requests) == 1
+
+
+def test_the_harness_asks_for_a_newcomers_summary_whatever_the_agent_says(
+    db: sqlite3.Connection, clock: FakeClock
+) -> None:
+    _store(db, clock)
+    _, spec = specs.current_spec(db)
+    expert = specs.patch_genome(
+        spec, "cs", "cs-reader", {"prompt": "Write for experts in the field only."}
+    )
+    specs.apply_spec(db, expert, actor="operator", now=clock())
+
+    run_id = _create(db, clock)
+
+    system = db.execute(
+        "SELECT prompt_system FROM runs WHERE id = ?", (run_id,)
+    ).fetchone()[0]
+    # The agent's own words come first; the harness rule follows and holds.
+    assert system.startswith("Write for experts in the field only.")
+    assert "summary for someone who knows nothing about the field" in system
+    assert "keep that depth in the claims, objections and idea seeds" in system
+    summary = run_engine.TOOLS["submit_reading"]["function"]["parameters"][
+        "properties"
+    ]["summary"]
+    assert "knows nothing about the field" in summary["description"]

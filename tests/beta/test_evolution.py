@@ -179,6 +179,8 @@ def test_the_run_threshold_breeds_a_child_from_the_island_and_another(
     child = decisions["cs-gen1"]
     assert (child["decision"], child["reason"]) == ("created", "rule_mating")
     assert child["parents"] == ["cs-reader", mates[0]["genome_id"]]
+    # No provider, so no proposal was asked for; the record says so.
+    assert (child["proposal"], child["proposal_reason"]) == ("not_asked", None)
     # Nothing is ranked: every other agent is simply kept.
     assert {d["decision"] for d in record["decisions"]} == {
         "parent",
@@ -264,9 +266,11 @@ def test_the_model_proposes_the_child_when_it_is_configured(
     assert bred["prompt"].startswith("Read for the central result")
     assert bred["model_settings"]["temperature"] == 0.75
     assert "submit_reading" in bred["allowed_tools"]
+    assert (child["proposal"], child["proposal_reason"]) == ("proposed", None)
+    # The child works its island's methods; the mate's domain stays on its island.
     assert "compare data splits" in bred["research_methods"]["instructions"]
-    assert "controlled perturbation" in bred["research_methods"]["instructions"]
-    assert bred["research_methods"]["domain"] == "mixed"
+    assert "controlled perturbation" not in bred["research_methods"]["instructions"]
+    assert bred["research_methods"]["domain"] == "cs"
     # The model saw the whole swarm, this island first, and the call was paid for.
     sent = client.requests[0]["messages"][1]["content"]
     assert sent.index("## CS island") < sent.index("## Bio island")
@@ -289,6 +293,9 @@ def test_a_failed_or_useless_proposal_falls_back_to_the_rule(
 
     child = _decisions(record)["cs-gen1"]
     assert child["reason"] == "rule_mating"
+    # The generation says why the rule bred instead of the model.
+    assert child["proposal"] == "failed"
+    assert child["proposal_reason"].startswith("provider down")
     assert (
         db.execute(
             "SELECT settlement FROM cost_receipts WHERE owner_kind = 'generation'"
@@ -316,6 +323,7 @@ def test_a_failed_or_useless_proposal_falls_back_to_the_rule(
     )
     second = _cycle(db, clock, provider=PROVIDER, client=elsewhere)
     assert _decisions(second)["cs-gen2"]["reason"] == "rule_mating"
+    assert _decisions(second)["cs-gen2"]["proposal"] == "no_parent_on_island"
 
 
 def test_the_budget_decides_whether_the_model_is_asked(
@@ -330,7 +338,8 @@ def test_the_budget_decides_whether_the_model_is_asked(
     record = _cycle(db, clock, provider=PROVIDER, client=client)
 
     assert client.requests == [] and record["cost_micros"] == 0
-    assert _decisions(record)["cs-gen1"]["reason"] == "rule_mating"
+    child = _decisions(record)["cs-gen1"]
+    assert (child["reason"], child["proposal"]) == ("rule_mating", "refused")
 
 
 def test_evolution_is_switched_off_for_the_swarm_or_for_one_island(
@@ -370,32 +379,77 @@ def test_with_mutation_off_a_cycle_is_recorded_and_breeds_nothing(
     assert [g["id"] for g in specs.find_island(after, "cs")["genomes"]] == FOUNDERS
 
 
-def test_over_its_cap_the_island_archives_its_least_run_agent(
+def test_over_its_cap_the_island_archives_its_most_run_evaluated_agent(
+    db: sqlite3.Connection, clock: FakeClock, paper: str
+) -> None:
+    _, spec = specs.current_spec(db)
+    _edit(db, clock, specs.patch_evolution(spec, {"max_agents_per_island": 3}))
+    for _ in range(8):
+        _run(db, clock, "cs-reader")
+    for _ in range(6):
+        _run(db, clock, "cs-skeptic")
+    # One run is not an evaluation: the builder keeps its place.
+    _run(db, clock, "cs-builder")
+
+    record = _cycle(db, clock)
+
+    decisions = {d["genome_id"]: d["decision"] for d in record["decisions"]}
+    assert decisions["cs-skeptic"] == "archived"
+    assert decisions["cs-reader"] == "parent" and decisions["cs-gen1"] == "created"
+    _, spec = specs.current_spec(db)
+    archived = specs.find_genome(spec, "cs-skeptic")[1]
+    assert archived["active"] is False and "before believing" in archived["prompt"]
+    active = [g["id"] for g in specs.find_island(spec, "cs")["genomes"] if g["active"]]
+    assert active == ["cs-reader", "cs-builder", "cs-gen1"]
+    # The archived agent takes no more papers.
+    clock.advance(hours=2)
+    result = advance_swarm(db, spec=spec, revision=3, provider=PROVIDER, clock=clock)
+    agents = {item["agent"] for item in result["started"] + result["waiting"]}
+    assert "cs-skeptic@cs" not in agents
+
+
+def test_a_child_waits_while_nobody_else_has_been_evaluated(
     db: sqlite3.Connection, clock: FakeClock, paper: str
 ) -> None:
     _, spec = specs.current_spec(db)
     _edit(db, clock, specs.patch_evolution(spec, {"max_agents_per_island": 3}))
     for _ in range(6):
         _run(db, clock, "cs-reader")
-    for _ in range(2):
-        _run(db, clock, "cs-skeptic")
+    _run(db, clock, "cs-skeptic")
     _run(db, clock, "cs-builder")
+    before, _ = specs.current_spec(db)
 
     record = _cycle(db, clock)
 
-    decisions = {d["genome_id"]: d["decision"] for d in record["decisions"]}
-    assert decisions["cs-builder"] == "archived"
-    assert decisions["cs-reader"] == "parent" and decisions["cs-gen1"] == "created"
-    _, spec = specs.current_spec(db)
-    archived = specs.find_genome(spec, "cs-builder")[1]
-    assert archived["active"] is False and "built on" in archived["prompt"]
-    active = [g["id"] for g in specs.find_island(spec, "cs")["genomes"] if g["active"]]
-    assert active == ["cs-reader", "cs-skeptic", "cs-gen1"]
-    # The archived agent takes no more papers.
-    clock.advance(hours=2)
-    result = advance_swarm(db, spec=spec, revision=3, provider=PROVIDER, clock=clock)
-    agents = {item["agent"] for item in result["started"] + result["waiting"]}
-    assert "cs-builder@cs" not in agents
+    assert (record["status"], record["reason"]) == ("skipped", "population_unevaluated")
+    assert specs.current_spec(db)[0] == before
+
+
+def test_the_parent_turns_and_likes_go_first_among_equals(
+    db: sqlite3.Connection, clock: FakeClock, paper: str
+) -> None:
+    def cycle() -> str:
+        for genome_id in FOUNDERS:
+            for _ in range(2):
+                _run(db, clock, genome_id)
+        record = _cycle(db, clock)
+        assert record["status"] == "committed"
+        return next(
+            d["genome_id"] for d in record["decisions"] if d["decision"] == "parent"
+        )
+
+    db.execute(
+        "INSERT INTO likes(id, island_id, target_kind, target_id, genome_id, created_at)"
+        " VALUES ('L-1', 'cs', 'agent', 'cs-skeptic', 'cs-skeptic', '2026-09-10T12:00:00Z')"
+    )
+    # The liked agent goes first; then the others take their turns, the older
+    # first; then the one that has waited longest, liked or not, goes again.
+    assert [cycle() for _ in range(4)] == [
+        "cs-skeptic",
+        "cs-reader",
+        "cs-builder",
+        "cs-skeptic",
+    ]
 
 
 def test_the_breeder_may_fail_out_a_lemon_and_likes_pick_the_parent(
@@ -438,11 +492,12 @@ def test_the_breeder_may_fail_out_a_lemon_and_likes_pick_the_parent(
     assert "1 points" in client.requests[0]["messages"][1]["content"]
     _, spec = specs.current_spec(db)
     assert specs.find_genome(spec, "cs-builder")[1]["active"] is False
-    # By rule the parent is the most liked agent too.
+    # By rule, one run is not an evaluation: the liked skeptic waits its turn
+    # and the reader, read in full, is the parent.
     for _ in range(6):
         _run(db, clock, "cs-reader")
     second = _cycle(db, clock)
-    assert _decisions(second)["cs-gen2"]["parents"][0] == "cs-skeptic"
+    assert _decisions(second)["cs-gen2"]["parents"][0] == "cs-reader"
 
 
 def test_an_archived_agent_can_be_brought_back_by_hand(
@@ -704,7 +759,11 @@ def test_population_cap_retires_completed_reader_instead_of_missing_vote(
 ) -> None:
     _unfinished_cohort(db, cfg, clock)
     _, spec = specs.current_spec(db)
-    _edit(db, clock, specs.patch_evolution(spec, {"max_agents_per_island": 3}))
+    _edit(
+        db,
+        clock,
+        specs.patch_evolution(spec, {"max_agents_per_island": 3, "runs_threshold": 1}),
+    )
     record = _cycle(db, clock, force=True)
     assert record["status"] == "committed"
     _, spec = specs.current_spec(db)

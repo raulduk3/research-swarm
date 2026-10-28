@@ -160,13 +160,21 @@ TOOLS: dict[str, ToolSchema] = {
     ),
     "submit_reading": tool_schema(
         "submit_reading",
-        "Submit the final reading and end the run. A claim that depends on the paper"
-        " text needs at least one exact quote as evidence. Say whether the island"
-        " should keep this paper as reference: it is held only if every reader says so.",
+        "Submit the final reading and end the run. The summary is for someone who"
+        " knows nothing about the field; the claims, objections and idea seeds keep"
+        " the full scientific detail. A claim that depends on the paper text needs"
+        " at least one exact quote as evidence. Say whether the island should keep"
+        " this paper as reference: it is held only if every reader says so.",
         {
             "type": "object",
             "properties": {
-                "summary": {"type": "string"},
+                "summary": {
+                    "type": "string",
+                    "description": "A plain-language explanation for a reader who knows"
+                    " nothing about the field: what problem the paper tackles, what"
+                    " was done, what was found and why it matters, in that order, with"
+                    " every technical term defined the first time or left out.",
+                },
                 "keep": {
                     "type": "boolean",
                     "description": "Should the island hold onto this paper as reference?",
@@ -223,8 +231,13 @@ HARNESS_RULES = (
     " Quote the paper exactly when you cite it; every quote is checked against"
     " the stored text. The submitted thesis_quote must be one exact sentence"
     " from the abstract. Label every claim's stance toward the paper: positive,"
-    " neutral or negative. End the run by calling submit_reading once. Prose outside"
-    " a tool call is not kept as the reading."
+    " neutral or negative. Read and reason with all the depth the paper needs,"
+    " and keep that depth in the claims, objections and idea seeds; write the"
+    " summary for someone who knows nothing about the field, in plain words that"
+    " say what problem the paper tackles, what was done, what was found and why"
+    " it matters, defining every technical term the first time or leaving it"
+    " out. End the run by calling submit_reading once. Prose outside a tool"
+    " call is not kept as the reading."
 )
 
 

@@ -257,28 +257,3 @@ def unique_instructions(text: str) -> str:
         seen.add(comparison)
         kept.append((unit, separator))
     return "".join(unit + separator for unit, separator in kept).strip()
-
-
-def mix_methods(profiles: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Blend complete parent instructions and sources without silently truncating."""
-    usable = [profile for profile in profiles if profile]
-    if not usable:
-        return {}
-    domains = {profile["domain"] for profile in usable}
-    sources: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for profile in usable:
-        for source in profile["sources"]:
-            if source["url"] not in seen:
-                seen.add(source["url"])
-                sources.append(dict(source))
-    return {
-        "version": max(profile["version"] for profile in usable),
-        "domain": usable[0]["domain"] if len(domains) == 1 else "mixed",
-        "specialist": len(domains) == 1
-        and all(profile["specialist"] for profile in usable),
-        "instructions": unique_instructions(
-            "\n\n".join(profile["instructions"] for profile in usable)
-        ),
-        "sources": sources,
-    }

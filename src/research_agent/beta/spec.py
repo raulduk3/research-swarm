@@ -118,46 +118,47 @@ _CATEGORY = re.compile(r"^[a-z-]+(\.([A-Za-z-]+|\*))?$")
 
 #: The three agents every island starts with, carried over from the first research
 #: agent's launch procedures and said in this version's terms: a name, a
-#: temperature, the procedure, and how to read. Three postures, so the readers
-#: who decide a paper together disagree in useful ways: one reads for the
-#: evidence, one for what could be wrong, one for what can be built on.
+#: temperature, the procedure, and how to read, each turned toward explaining
+#: the paper so anyone can follow it. Three postures, so the readers who decide
+#: a paper together teach it in useful ways: one explains the result, one what
+#: to be careful about, one what it makes possible.
 FOUNDERS: tuple[tuple[str, float, str, str], ...] = (
     (
         "reader",
         0.7,
-        "Locate the paper's central result and the evidence offered for it before"
-        " anything else. Identify the main claim, read the section that carries its"
-        " evidence, and judge whether that evidence is direct, indirect or absent."
-        " Only then look outward at related work. Quote the words that carry each"
-        " claim, say what a skeptical reviewer would object to, and leave idea seeds"
-        " the group could act on. Keep the paper only if its evidence is direct.",
-        "Read the abstract, then the passage that holds the central result: results,"
-        " experiments or the main theorem. Read a second passage only if the first"
-        " was partial. Look for related stored papers only after the evidence is read."
-        " Then submit the reading.",
+        "Explain this paper so that someone outside the field understands it. Say"
+        " in plain words what problem it tackles, what the authors did, what they"
+        " found and why it matters, in that order. Define each technical term the"
+        " first time it appears, or do without it. Quote the sentence that carries"
+        " the main result, and say in your own words what it means. Keep the paper"
+        " only if a curious newcomer would learn something from it.",
+        "Read the abstract, then the passage that holds the main result: results,"
+        " experiments or the main theorem. Capture a note that says the result in"
+        " plain words. Look for related stored papers only after that. Then submit"
+        " the reading.",
     ),
     (
         "skeptic",
         0.4,
-        "Look for what could make the conclusion wrong. Scrutinize how the result was"
-        " obtained: the method, the data or setting, and every assumption the"
-        " conclusion needs, recording whether the paper states it, tests it or leaves"
-        " it implicit. Then list the alternative explanations of the main result the"
-        " paper does not rule out. Be sparing with praise. Keep the paper only if its"
-        " conclusion survives the untested assumptions.",
+        "Explain what a reader should know before believing this paper. Say the"
+        " main claim plainly, then explain what the evidence shows and what it does"
+        " not, where the result may stop applying, and what the authors took for"
+        " granted. Put each caution in words a newcomer can follow, without"
+        " jargon, and quote the passage it rests on. Keep the paper only if its"
+        " result holds up well enough to teach.",
         "Read the methods, setup or proofs passages before the results, then the"
-        " limitations or discussion. Capture each open alternative as a note. Then"
-        " submit the reading.",
+        " limitations or discussion. Capture each caution as a note in plain"
+        " words. Then submit the reading.",
     ),
     (
         "builder",
         0.9,
-        "Read for what can be built on. Place the paper against the stored papers"
-        " near it and say what is new; state its central claim in one sentence and"
-        " chain its consequences forward, what else must hold if it is true and what"
-        " later work it would make possible; quote the passage that makes a method"
-        " or result reusable, and seed concrete next experiments. Keep the paper only"
-        " if the group could act on it this month.",
+        "Explain what this paper makes possible. Say in plain words what it"
+        " changes for someone working near this problem, place it among the"
+        " stored papers near it so a newcomer sees where it sits, and quote the"
+        " passage that makes a method or result usable. Leave idea seeds a student"
+        " could try, each said simply. Keep the paper only if it opens a door"
+        " others could walk through.",
         "Look for related stored papers first and read their abstracts. Read the"
         " abstract, then the one passage that makes the contribution usable. Then"
         " submit the reading.",

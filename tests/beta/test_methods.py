@@ -127,7 +127,7 @@ def test_upgrade_versions_every_agent_without_changing_history(
     )
 
 
-def test_evolution_child_mixes_parent_domains_after_mating(
+def test_evolution_child_keeps_its_islands_methods_after_mating(
     db: sqlite3.Connection, clock: FakeClock
 ) -> None:
     result = maybe_run_evolution(db, "bio", clock(), force=True)
@@ -137,7 +137,9 @@ def test_evolution_child_mixes_parent_domains_after_mating(
     assert "Biology: mechanisms" in child["research_methods"]["instructions"]
     assert "Also, from" not in child["prompt"]
     assert "http" not in child["prompt"]
-    assert "Computer science: empirical" in child["research_methods"]["instructions"]
+    # The mate's island does not lend its domain methods.
+    for label in ("Computer science", "Quantum research", "General research"):
+        assert label not in child["research_methods"]["instructions"]
 
 
 def test_oversized_mating_records_refusal_and_preserves_population(
@@ -325,7 +327,7 @@ def test_upgrade_cleans_nested_mating_labels_from_recorded_ancestors(
     assert older_donor not in system and "cs-gen1" not in system
 
 
-def test_mating_keeps_both_method_contributions_once() -> None:
+def test_mating_keeps_the_parents_methods_and_says_an_instruction_once() -> None:
     from research_agent.beta.evolution import mate_genomes
 
     doc = specs.default_spec()
@@ -342,15 +344,34 @@ def test_mating_keeps_both_method_contributions_once() -> None:
     result = mate_genomes(parent, mate, [parent, mate], "method-mating")
     assert result is not None
     child = result[0]
-    assert child["research_methods"]["instructions"] == (
-        "Shared method. Compare matched baselines.\n\nCheck certification assumptions."
-    )
+    assert child["research_methods"] == parent["research_methods"]
     assert child["prompt"].count("Check claims.") == 1
-    assert {source["url"] for source in child["research_methods"]["sources"]} == {
-        source["url"]
-        for genome in (parent, mate)
-        for source in genome["research_methods"]["sources"]
-    }
+
+
+def test_chained_mating_adds_one_emphasis_and_no_methods() -> None:
+    from research_agent.beta.evolution import mate_genomes
+
+    doc = specs.default_spec()
+    cs = doc["islands"][0]["genomes"]
+    quant_skeptic = doc["islands"][1]["genomes"][1]
+    bio_builder = doc["islands"][2]["genomes"][2]
+    first = mate_genomes(cs[0], quant_skeptic, cs, "chain-1")
+    assert first is not None
+    child = {"id": "cs-gen1", **first[0]}
+    assert "before believing" in child["prompt"]
+    second = mate_genomes(child, bio_builder, [*cs, child], "chain-2")
+    assert second is not None
+    grandchild = second[0]
+    # The grandchild carries its grandparent's own words and the builder's
+    # bent, not the skeptic's as well, and only its island's methods.
+    assert grandchild["prompt"].count("Additional reading emphasis:") == 1
+    assert grandchild["prompt"].startswith(cs[0]["prompt"].split(". ")[0])
+    assert "before believing" not in grandchild["prompt"]
+    assert "opens a door" in grandchild["prompt"]
+    assert grandchild["research_methods"] == cs[0]["research_methods"]
+    assert len(grandchild["research_methods"]["instructions"]) == len(
+        cs[0]["research_methods"]["instructions"]
+    )
 
 
 def test_new_agent_prompt_removes_repeated_instructions() -> None:
@@ -376,11 +397,9 @@ def test_persisted_evolution_keeps_actual_parent_methods(
     assert result is not None and result["status"] == "committed"
     _, evolved = specs.current_spec(db)
     child = specs.find_genome(evolved, "cs-gen1")[1]
-    assert len(child["lineage"]["parents"]) == 2
-    for parent_id in child["lineage"]["parents"]:
-        assert (
-            f"Procedure for {parent_id}." in child["research_methods"]["instructions"]
-        )
+    parent_id, mate_id = child["lineage"]["parents"]
+    assert f"Procedure for {parent_id}." in child["research_methods"]["instructions"]
+    assert f"Procedure for {mate_id}." not in child["research_methods"]["instructions"]
 
 
 @pytest.mark.parametrize(
@@ -521,35 +540,6 @@ def test_existing_archived_agents_upgrade_without_losing_custom_methods(
     assert current["version"] == agent["version"] + 1
     assert specs.get_revision(db, revision + 1)["spec"] == legacy
     assert specs.upgrade_methods(db, now=clock())["changes"] == []
-
-
-def test_repeated_breeding_does_not_accumulate_shared_methods() -> None:
-    from research_agent.beta.methods import mix_methods
-
-    doc = specs.default_spec()
-    first = doc["islands"][0]["genomes"][0]["research_methods"]
-    second = doc["islands"][2]["genomes"][0]["research_methods"]
-    blended = mix_methods([first, second])
-    for _ in range(12):
-        blended = mix_methods([blended, first, second])
-    assert blended == mix_methods([first, second])
-    assert blended["instructions"].count("These tools retrieve stored evidence;") == 1
-
-
-def test_method_blend_overflow_is_rejected_without_losing_donor() -> None:
-    from research_agent.beta.errors import Invalid
-    from research_agent.beta.methods import mix_methods
-
-    agent = copy.deepcopy(specs.default_spec()["islands"][0]["genomes"][0])
-    first = copy.deepcopy(agent["research_methods"])
-    second = copy.deepcopy(first)
-    first["instructions"] = "Parent method " + "a" * 2100
-    second["instructions"] = "Donor method " + "b" * 2100
-    agent["research_methods"] = mix_methods([first, second])
-    assert "Parent method" in agent["research_methods"]["instructions"]
-    assert "Donor method" in agent["research_methods"]["instructions"]
-    with pytest.raises(Invalid, match="4000 characters"):
-        specs.validate_genome(agent, "child")
 
 
 @pytest.mark.parametrize(
