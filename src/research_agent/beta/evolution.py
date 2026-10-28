@@ -349,6 +349,8 @@ class Standing:
     last_parent: int
     #: Whether it has completed a threshold's worth of runs: been read.
     evaluated: bool
+    #: Its place in the island's list: the older first.
+    age: int
 
 
 def _standings(
@@ -369,7 +371,7 @@ def _standings(
                     last.get(str(decision["genome_id"]), 0), int(number)
                 )
     standings: dict[str, Standing] = {}
-    for agent in agents:
+    for age, agent in enumerate(agents):
         genome_id = str(agent["id"])
         runs = _runs_of(db, genome_id)
         standings[genome_id] = Standing(
@@ -377,6 +379,7 @@ def _standings(
             points=points_of(db, genome_id),
             last_parent=last.get(genome_id, 0),
             evaluated=runs >= threshold,
+            age=age,
         )
     return standings
 
@@ -393,14 +396,13 @@ def _next_parent(
     evaluated = [g for g in active if standing[str(g["id"])].evaluated]
     read = [g for g in active if standing[str(g["id"])].runs]
     pool = evaluated or read or list(active)
-    age = {str(g["id"]): index for index, g in enumerate(active)}
     return min(
         pool,
         key=lambda g: (
             standing[str(g["id"])].last_parent,
             -standing[str(g["id"])].points,
             -standing[str(g["id"])].runs,
-            age[str(g["id"])],
+            standing[str(g["id"])].age,
         ),
     )
 
@@ -766,13 +768,12 @@ def maybe_run_evolution(
             return close()
         # The agent that has had the most chances and earned the fewest likes,
         # the older first among equals.
-        age = {str(g["id"]): index for index, g in enumerate(active)}
         victim = min(
             evaluated,
             key=lambda g: (
                 standing[str(g["id"])].points,
                 -standing[str(g["id"])].runs,
-                age[str(g["id"])],
+                standing[str(g["id"])].age,
             ),
         )
         archived = str(victim["id"])

@@ -179,6 +179,8 @@ def test_the_run_threshold_breeds_a_child_from_the_island_and_another(
     child = decisions["cs-gen1"]
     assert (child["decision"], child["reason"]) == ("created", "rule_mating")
     assert child["parents"] == ["cs-reader", mates[0]["genome_id"]]
+    # No provider, so no proposal was asked for; the record says so.
+    assert (child["proposal"], child["proposal_reason"]) == ("not_asked", None)
     # Nothing is ranked: every other agent is simply kept.
     assert {d["decision"] for d in record["decisions"]} == {
         "parent",
