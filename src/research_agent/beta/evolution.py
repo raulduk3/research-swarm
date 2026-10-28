@@ -1,11 +1,15 @@
 """Evolution: a switch, a cadence, and a generative step with no fitness function.
 
 Nothing here ranks agents. When an island has finished enough runs since its
-last generation, a child is made for it by mating: a parent from the island
-and a mate from another island are combined, then one thing is changed. A
-model proposes the child from the whole swarm's state when a provider is
-configured and the budget admits the call; otherwise a seeded rule does the
-mating, so a cycle always produces something and a test can repeat it.
+last generation, a child is made for it by changing exactly one thing about
+one of its agents: one sentence of its prompt or reading strategy replaced,
+added or dropped, its temperature or output budget nudged a step, or one tool
+toggled. The material comes first from a mate on another island, one
+sentence or tool at a time, so behavior crosses islands incrementally; when
+nothing of the mate's is new, from fixed pools and small steps. A model may
+propose the one change, seeing the parent in full and the whole swarm, and
+is held to one change by a sentence-level diff; otherwise a seeded rule
+picks it, so a cycle always produces something and a test can repeat it.
 
 The parent turns: the island's agents take it in the order of who has waited
 longest since last being a parent, the liked ones first among equals, and an
@@ -48,6 +52,7 @@ from research_agent.beta.likes import points_of
 from research_agent.beta.models import ModelCallFailed, ModelClient
 from research_agent.beta.methods import (
     instruction_key,
+    instruction_units,
     island_methods,
     unique_instructions,
 )
@@ -77,7 +82,12 @@ STRATEGIES = (
     " the cautions, then submit the reading.",
 )
 OPTIONAL_TOOLS = ("related_papers", "capture_note", "feedback_context", "cost_state")
-_EMPHASIS = "\n\nEmphasis: "
+#: One step of temperature, and one step of output budget as a share of it.
+TEMPERATURE_STEP = 0.05
+TOKEN_STEP = 0.1
+#: Past these, a prompt or strategy takes no new sentence, only a swap or a drop.
+PROMPT_SENTENCES = 12
+STRATEGY_SENTENCES = 6
 #: Output the proposing model is given to answer with.
 PROPOSAL_TOKENS = 1200
 
@@ -95,13 +105,13 @@ PROPOSE_TOOL: Json = {
                 "parents": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Ids of the agents mated, at least one of this island's.",
+                    "description": "The agent edited, then any agent the change was taken from.",
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Complete reading instructions only, aimed at explaining the"
-                    " paper so anyone can understand it. Do not include parent ids, source"
-                    " attribution or inherited-from labels; put origins in parents and why.",
+                    "description": "The edited agent's complete prompt after the one change,"
+                    " otherwise word for word as given. Reading instructions only; no parent"
+                    " ids, source attribution or inherited-from labels.",
                 },
                 "reading_strategy": {"type": "string"},
                 "temperature": {"type": "number"},
@@ -125,18 +135,21 @@ _SYSTEM = (
     " explains each one so that anyone can understand it. Each agent is a"
     " prompt, a reading strategy, a temperature, an output budget and a set of"
     " tools. There is no score to optimize: the point is variety in how papers"
-    " are taught, plain ways of explaining the swarm has not tried, built from"
-    " what works in other agents, on this island and across the others. Mate"
-    " two or more agents, keep what is distinctive in each, change one thing,"
-    " and keep the prompt under 900 characters. A child's prompt tells it to"
-    " say in plain words what problem the paper tackles, what was done, what was"
-    " found and why it matters, with no term left undefined. People give likes;"
-    " an agent's points are the likes on its work and on papers it voted to"
-    " keep, and they tell you what people found clear, not what is right. If one"
-    " of the island's agents is plainly a lemon, name it in archive with a"
-    " reason. Answer only by calling propose_child. Write only reading"
-    " instructions in the child prompt; do not name its parents, sources or the"
-    " origin of an inherited instruction."
+    " are taught, found one small step at a time so each step can be read and"
+    " judged. You are given one agent in full. Change exactly one thing about"
+    " it and nothing else: replace, add or drop one sentence of its prompt or"
+    " of its reading strategy, move its temperature by at most 0.1, move its"
+    " output budget by at most a tenth, or add or remove one tool. Take the"
+    " change from another agent in the swarm when one has something worth"
+    " trying, and name that agent after the edited one in parents. Keep every"
+    " other word as it is; a proposal that changes more than one thing is"
+    " refused. A prompt sentence should help the agent say in plain words what"
+    " problem the paper tackles, what was done, what was found and why it"
+    " matters, with no term left undefined. People give likes; an agent's points"
+    " are the likes on its work and on papers it voted to keep, and they tell"
+    " you what people found clear, not what is right. If one of the island's"
+    " agents is plainly a lemon, name it in archive with a reason. Answer only"
+    " by calling propose_child."
 )
 
 
@@ -203,41 +216,201 @@ def swarm_digest(
     return "\n".join(parts)
 
 
+Units = list[tuple[str, str]]
+
+
+def _key(unit: str) -> tuple[tuple[str, str], ...]:
+    return instruction_key(unit.strip())
+
+
+def _text(units: Units) -> str:
+    return "".join(unit + separator for unit, separator in units).strip()
+
+
+def _with_added(units: Units, sentence: str) -> Units:
+    if not units:
+        return [(sentence, "")]
+    last, _ = units[-1]
+    return [*units[:-1], (last, " "), (sentence, "")]
+
+
+def _with_swapped(units: Units, index: int, sentence: str) -> Units:
+    return [
+        (sentence if i == index else unit, separator)
+        for i, (unit, separator) in enumerate(units)
+    ]
+
+
+def _with_dropped(units: Units, index: int) -> Units:
+    kept = [pair for i, pair in enumerate(units) if i != index]
+    if kept and index == len(units) - 1:
+        kept[-1] = (kept[-1][0], "")
+    elif index > 0:
+        # A paragraph break the dropped sentence carried stays with the text.
+        before, dropped = units[index - 1][1], units[index][1]
+        if dropped.count("\n") > before.count("\n"):
+            kept[index - 1] = (kept[index - 1][0], dropped)
+    return kept
+
+
+def _sentence_offers(
+    field: str,
+    text: str,
+    donors: Sequence[tuple[str, str]],
+    *,
+    limit: int,
+    first_fixed: bool,
+) -> list[tuple[str, Json]]:
+    """Every one-sentence edit of *text*: (new text, what changed).
+
+    *donors* are (sentence, source) pairs; a donor already in the text is not
+    offered. A sentence is added only below *limit*, the first sentence is
+    never swapped or dropped when *first_fixed*, and the only sentence is
+    never dropped.
+    """
+    units = instruction_units(text)
+    present = {_key(unit) for unit, _ in units}
+    lowest = 1 if first_fixed else 0
+    offers: list[tuple[str, Json]] = []
+    for sentence, source in donors:
+        if _key(sentence) in present:
+            continue
+        if len(units) < limit:
+            offers.append(
+                (
+                    _text(_with_added(units, sentence)),
+                    {
+                        "operator": "add_sentence",
+                        "field": field,
+                        "source": source,
+                        "sentence": sentence,
+                    },
+                )
+            )
+        for index in range(lowest, len(units)):
+            offers.append(
+                (
+                    _text(_with_swapped(units, index, sentence)),
+                    {
+                        "operator": "swap_sentence",
+                        "field": field,
+                        "source": source,
+                        "sentence": sentence,
+                        "replaced": units[index][0].strip(),
+                    },
+                )
+            )
+    if len(units) > 1:
+        for index in range(lowest, len(units)):
+            offers.append(
+                (
+                    _text(_with_dropped(units, index)),
+                    {
+                        "operator": "drop_sentence",
+                        "field": field,
+                        "source": "parent",
+                        "replaced": units[index][0].strip(),
+                    },
+                )
+            )
+    return offers
+
+
 def _mutations(
-    genome: Mapping[str, Any], rng: random.Random
+    genome: Mapping[str, Any],
+    rng: random.Random,
+    mate: Mapping[str, Any] | None = None,
 ) -> list[tuple[Json, Json]]:
-    """Every single-field change on offer, shuffled: (new content, description)."""
+    """Every single change on offer, shuffled: (new content, description).
+
+    Each offer differs from *genome* in exactly one place. Changes taken from
+    the mate come before those from the pools and the numeric steps, so a
+    cross is tried first whenever the mate has something new.
+    """
     content = {name: copy.deepcopy(genome.get(name, {})) for name in GENOME_CONTENT}
-    offers: list[tuple[Json, Json]] = []
+    from_mate: list[tuple[Json, Json]] = []
+    from_pool: list[tuple[Json, Json]] = []
 
-    def offer(field: str, value: Any, operator: str) -> None:
+    def offer(field: str, value: Any, description: Json) -> None:
         if value != content[field]:
-            description = {"operator": operator, "field": field}
-            offers.append(({**content, field: value}, description))
+            bucket = from_mate if description.get("source") == "mate" else from_pool
+            bucket.append(({**content, field: value}, description))
 
-    base = str(content["prompt"]).split(_EMPHASIS)[0]
-    for emphasis in EMPHASES:
-        offer("prompt", f"{base}{_EMPHASIS}{emphasis}", "emphasis")
-    for strategy in STRATEGIES:
-        offer("reading_strategy", strategy, "strategy")
+    mate_prompt = [
+        (unit.strip(), "mate")
+        for unit, _ in (instruction_units(str(mate["prompt"])) if mate else [])
+    ]
+    mate_strategy = [
+        (unit.strip(), "mate")
+        for unit, _ in (
+            instruction_units(str(mate["reading_strategy"])) if mate else []
+        )
+    ]
+    for text, description in _sentence_offers(
+        "prompt",
+        str(content["prompt"]),
+        [*mate_prompt[1:], *((sentence, "pool") for sentence in EMPHASES)],
+        limit=PROMPT_SENTENCES,
+        first_fixed=True,
+    ):
+        offer("prompt", text, description)
+    for text, description in _sentence_offers(
+        "reading_strategy",
+        str(content["reading_strategy"]),
+        [*mate_strategy, *((sentence, "pool") for sentence in STRATEGIES)],
+        limit=STRATEGY_SENTENCES,
+        first_fixed=False,
+    ):
+        offer("reading_strategy", text, description)
     settings = content["model_settings"]
-    for step in (-0.15, 0.15):
+    for step in (-TEMPERATURE_STEP, TEMPERATURE_STEP):
         temperature = round(min(1.2, max(0.1, settings["temperature"] + step)), 2)
-        offer("model_settings", {**settings, "temperature": temperature}, "temperature")
-    for factor in (0.8, 1.25):
-        tokens = int(min(2000, max(256, settings["max_output_tokens"] * factor)))
         offer(
-            "model_settings", {**settings, "max_output_tokens": tokens}, "output_tokens"
+            "model_settings",
+            {**settings, "temperature": temperature},
+            {
+                "operator": "temperature",
+                "field": "model_settings",
+                "source": "pool",
+                "from": settings["temperature"],
+                "to": temperature,
+            },
+        )
+    for factor in (1 - TOKEN_STEP, 1 + TOKEN_STEP):
+        tokens = int(min(2000, max(256, round(settings["max_output_tokens"] * factor))))
+        offer(
+            "model_settings",
+            {**settings, "max_output_tokens": tokens},
+            {
+                "operator": "output_tokens",
+                "field": "model_settings",
+                "source": "pool",
+                "from": settings["max_output_tokens"],
+                "to": tokens,
+            },
         )
     for tool in OPTIONAL_TOOLS:
         tools = list(content["allowed_tools"])
-        if tool in tools:
+        had = tool in tools
+        if had:
             tools.remove(tool)
         else:
             tools.append(tool)
-        offer("allowed_tools", tools, "tool")
-    rng.shuffle(offers)
-    return offers
+        toward_mate = mate is not None and (tool in mate["allowed_tools"]) != had
+        offer(
+            "allowed_tools",
+            tools,
+            {
+                "operator": "tool",
+                "field": "allowed_tools",
+                "source": "mate" if toward_mate else "pool",
+                "tool": tool,
+                "to": "removed" if had else "added",
+            },
+        )
+    rng.shuffle(from_mate)
+    rng.shuffle(from_pool)
+    return from_mate + from_pool
 
 
 def _same(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
@@ -257,76 +430,108 @@ def _same(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
     return all(comparable(a, name) == comparable(b, name) for name in GENOME_CONTENT)
 
 
+def changes(parent: Mapping[str, Any], child: Mapping[str, Any]) -> list[Json]:
+    """Where a child differs from its parent, one entry per place.
+
+    A sentence added and one removed in the same text count as one place (a
+    swap); more than one added or removed count as two. A temperature move
+    over 0.1, an output budget move over a tenth, or more than one tool
+    toggled also count as two places, so a caller can require subtlety by
+    asking for exactly one entry.
+    """
+    found: list[Json] = []
+    for field in ("prompt", "reading_strategy"):
+        before = [
+            unit.strip() for unit, _ in instruction_units(str(parent.get(field, "")))
+        ]
+        after = [
+            unit.strip() for unit, _ in instruction_units(str(child.get(field, "")))
+        ]
+        removed = [u for u in before if _key(u) not in {_key(v) for v in after}]
+        added = [u for u in after if _key(u) not in {_key(v) for v in before}]
+        if not removed and not added:
+            continue
+        place: Json = {"field": field, "removed": removed, "added": added}
+        if len(removed) > 1 or len(added) > 1:
+            found.extend([place, {**place, "more": True}])
+        else:
+            found.append(place)
+    old = parent.get("model_settings", {})
+    new = child.get("model_settings", {})
+    if old.get("temperature") != new.get("temperature"):
+        place = {
+            "field": "temperature",
+            "from": old.get("temperature"),
+            "to": new.get("temperature"),
+        }
+        found.append(place)
+        if (
+            abs(float(new.get("temperature", 0)) - float(old.get("temperature", 0)))
+            > 0.1 + 1e-9
+        ):
+            found.append({**place, "more": True})
+    if old.get("max_output_tokens") != new.get("max_output_tokens"):
+        place = {
+            "field": "max_output_tokens",
+            "from": old.get("max_output_tokens"),
+            "to": new.get("max_output_tokens"),
+        }
+        found.append(place)
+        if abs(
+            int(new.get("max_output_tokens", 0)) - int(old.get("max_output_tokens", 0))
+        ) > (TOKEN_STEP * int(old.get("max_output_tokens", 0)) + 0.5):
+            found.append({**place, "more": True})
+    toggled = sorted(
+        set(parent.get("allowed_tools", [])) ^ set(child.get("allowed_tools", []))
+    )
+    if toggled:
+        place = {"field": "allowed_tools", "toggled": toggled}
+        found.append(place)
+        if len(toggled) > 1:
+            found.append({**place, "more": True})
+    if parent.get("research_methods") != child.get("research_methods"):
+        found.append({"field": "research_methods"})
+    return found
+
+
 def mutate_genome(
     genome: Mapping[str, Any], existing: Sequence[Mapping[str, Any]], seed: str
 ) -> tuple[Json, Json] | None:
-    """One field-level change to a genome that no existing agent already is.
+    """One small change to a genome that no existing agent already is.
 
     The same seed gives the same child. Returns the child's content and what
     was changed, or ``None`` when every offered change repeats an agent.
     """
-    for content, description in _mutations(genome, random.Random(seed)):
-        if not any(_same(content, other) for other in existing):
-            return content, description
-    return None
-
-
-_BENT = "\n\nAdditional reading emphasis: "
-
-
-def _own(prompt: str) -> str:
-    """An agent's own instructions: its prompt without what breeding added.
-
-    Breeding adds at most one emphasis paragraph and one emphasis line, so a
-    child of a child does not pile its ancestors' paragraphs up.
-    """
-    core = prompt.split(_EMPHASIS)[0]
-    return "\n\n".join(
-        paragraph
-        for paragraph in core.split("\n\n")
-        if not paragraph.startswith(_BENT.strip())
-    ).strip()
-
-
-def _bent(prompt: str) -> str:
-    """The part of a prompt after its first sentence: what makes the agent itself."""
-    head, _, rest = prompt.partition(". ")
-    return rest.strip() if rest.strip() else head.strip()
+    return mate_genomes(genome, None, existing, seed)
 
 
 def mate_genomes(
     parent: Mapping[str, Any],
-    mate: Mapping[str, Any],
+    mate: Mapping[str, Any] | None,
     existing: Sequence[Mapping[str, Any]],
     seed: str,
 ) -> tuple[Json, Json] | None:
-    """Cross two agents by rule, then change one thing.
+    """Change one thing about the parent, taking it from the mate when it can.
 
-    The child keeps the parent's own instructions and research methods, and
-    takes the mate's bent as its one added paragraph, the mate's reading
-    strategy, the mean temperature and the union of tools. The same seed
-    gives the same child; ``None`` when every offered change repeats an agent
-    already on the island.
+    The child is the parent with one sentence of its prompt or strategy
+    replaced, added or dropped, one setting nudged a step, or one tool
+    toggled; the mate's sentences and tools are tried before the pools, and
+    the description says where the change came from (``source`` of ``mate``,
+    ``pool`` or ``parent``). The same seed gives the same child; ``None``
+    when every offered change repeats an agent already on the island.
     """
-    base = _own(str(parent["prompt"]))
-    bent = _bent(_own(str(mate["prompt"])))
-    mean = (
-        float(parent["model_settings"]["temperature"])
-        + float(mate["model_settings"]["temperature"])
-    ) / 2
-    crossed: Json = {
-        "prompt": unique_instructions(f"{base}{_BENT}{bent}"),
-        "research_methods": copy.deepcopy(parent.get("research_methods", {})),
-        "model_settings": {**parent["model_settings"], "temperature": round(mean, 2)},
-        "allowed_tools": sorted(
-            set(parent["allowed_tools"]) | set(mate["allowed_tools"])
-        ),
-        "reading_strategy": mate["reading_strategy"],
-        "scoring_preferences": parent["scoring_preferences"],
-    }
-    for content, description in _mutations(crossed, random.Random(seed)):
-        if not any(_same(content, other) for other in existing):
-            return content, {**description, "crossed_with": mate["id"]}
+    for content, description in _mutations(parent, random.Random(seed), mate):
+        if any(_same(content, other) for other in existing):
+            continue
+        try:
+            validate_genome({"id": "child", **content}, "child")
+        except Invalid:
+            # An offer the validator refuses, such as a sentence that takes a
+            # prompt over its limit, is passed over for the next.
+            continue
+        if mate is not None and description.get("source") == "mate":
+            description = {**description, "crossed_with": mate["id"]}
+        return content, description
     return None
 
 
@@ -432,12 +637,19 @@ def _proposal_from_model(
     client: ModelClient,
     generation_id: str,
     now: datetime,
+    parent: Mapping[str, Any],
 ) -> tuple[Json | None, Json]:
-    """Ask the model for a child. Returns (content or None, what happened)."""
+    """Ask the model for one change to *parent*. Returns (content or None, what happened)."""
     island_id = str(island["id"])
+    settings = parent["model_settings"]
     user = (
         f"Make one new agent for {island['name']} ({island_id}), whose focus is"
-        f" {island['focus']}.\n\n{swarm_digest(db, spec, island_id)}"
+        f" {island['focus']}, by changing exactly one thing about {parent['id']}."
+        f" Here it is in full.\n\nprompt: {parent['prompt']}\n\nreading_strategy:"
+        f" {parent['reading_strategy']}\n\ntemperature: {settings['temperature']}\n"
+        f"max_output_tokens: {settings['max_output_tokens']}\nallowed_tools:"
+        f" {', '.join(parent['allowed_tools'])}\n\nThe rest of the swarm, to take"
+        f" the change from:\n\n{swarm_digest(db, spec, island_id)}"
     )
     estimate = price_micros(provider, estimate_tokens(_SYSTEM + user), PROPOSAL_TOKENS)
     refused = admit_paid(
@@ -498,39 +710,38 @@ def _proposal_from_model(
     if not isinstance(arguments, Mapping):
         return None, {"model": "malformed_proposal", "cost_micros": amount}
     known = {g["id"]: g for item in spec["islands"] for g in item["genomes"]}
-    parents = [
-        p for p in arguments.get("parents", []) if isinstance(p, str) and p in known
+    parents = [str(parent["id"])] + [
+        p
+        for p in dict.fromkeys(arguments.get("parents", []))
+        if isinstance(p, str) and p in known and p != parent["id"]
     ]
-    own = [p for p in parents if any(g["id"] == p for g in island["genomes"])]
-    if not own:
-        return None, {"model": "no_parent_on_island", "cost_micros": amount}
-    first = known[own[0]]
     tools = [
         t
-        for t in (arguments.get("allowed_tools") or first["allowed_tools"])
+        for t in (arguments.get("allowed_tools") or parent["allowed_tools"])
         if t in TOOL_NAMES
     ]
     if "submit_reading" not in tools:
         tools.append("submit_reading")
     try:
-        temperature = float(arguments.get("temperature", 0.7))
+        temperature = float(arguments.get("temperature", settings["temperature"]))
         tokens = int(
-            arguments.get("max_output_tokens")
-            or first["model_settings"]["max_output_tokens"]
+            arguments.get("max_output_tokens") or settings["max_output_tokens"]
         )
     except (TypeError, ValueError):
         return None, {"model": "malformed_proposal", "cost_micros": amount}
     content: Json = {
-        "prompt": str(arguments.get("prompt", ""))[:1800],
-        "research_methods": copy.deepcopy(first.get("research_methods"))
+        "prompt": str(arguments.get("prompt") or parent["prompt"]),
+        "research_methods": copy.deepcopy(parent.get("research_methods"))
         or island_methods(island),
         "model_settings": {
             "temperature": round(min(1.2, max(0.1, temperature)), 2),
             "max_output_tokens": int(min(2000, max(256, tokens))),
         },
         "allowed_tools": sorted(set(tools)),
-        "reading_strategy": str(arguments.get("reading_strategy", ""))[:600],
-        "scoring_preferences": first["scoring_preferences"],
+        "reading_strategy": str(
+            arguments.get("reading_strategy") or parent["reading_strategy"]
+        ),
+        "scoring_preferences": parent["scoring_preferences"],
     }
     try:
         validate_genome({"id": "child", **content}, "child")
@@ -540,12 +751,20 @@ def _proposal_from_model(
             "reason": exc.message,
             "cost_micros": amount,
         }
+    places = changes(parent, content)
+    if len(places) > 1:
+        return None, {
+            "model": "too_many_changes",
+            "reason": ", ".join(dict.fromkeys(str(place["field"]) for place in places)),
+            "cost_micros": amount,
+        }
     if any(_same(content, g) for g in island["genomes"]):
         return None, {"model": "repeats_an_agent", "cost_micros": amount}
     lemon = arguments.get("archive")
     on_island = {str(g["id"]) for g in island["genomes"] if g["active"]}
     return content, {
         "model": "proposed",
+        "change": {**places[0], "source": "model"},
         "parents": parents,
         "why": str(arguments.get("why", ""))[:300],
         "archive": lemon
@@ -704,15 +923,12 @@ def maybe_run_evolution(
                 client=client,
                 generation_id=str(record["id"]),
                 now=now,
+                parent=parent,
             )
             record["cost_micros"] = int(how.get("cost_micros", 0))
         if child is None:
             seed = f"{island_id}:{number}"
-            bred = (
-                mate_genomes(parent, mate, island["genomes"], seed)
-                if mate is not None
-                else mutate_genome(parent, island["genomes"], seed)
-            )
+            bred = mate_genomes(parent, mate, island["genomes"], seed)
             if bred is None:
                 record["reason"] = "no_novel_child"
                 record["decisions"].append(
@@ -724,12 +940,9 @@ def maybe_run_evolution(
                     }
                 )
                 return close()
-            child = bred[0]
-            how = {
-                **how,
-                "rule": bred[1],
-                "parents": [parent["id"]] + ([mate["id"]] if mate is not None else []),
-            }
+            child, change = bred
+            crossed = [mate["id"]] if mate and change.get("source") == "mate" else []
+            how = {**how, "change": change, "parents": [parent["id"], *crossed]}
 
     if child is not None:
         child["research_methods"] = child.get("research_methods") or island_methods(
@@ -798,7 +1011,7 @@ def maybe_run_evolution(
             },
             "parents": parents,
             "generation": number,
-            "mutation": how.get("rule"),
+            "mutation": how.get("change"),
             "proposed_by": "model" if how.get("model") == "proposed" else "rule",
             "why": how.get("why"),
         }
@@ -838,7 +1051,7 @@ def maybe_run_evolution(
             "created",
             "model_mating" if how.get("model") == "proposed" else "rule_mating",
             parents=parents,
-            mutation=how.get("rule"),
+            mutation=how.get("change"),
             why=how.get("why"),
             proposal=how.get("model"),
             proposal_reason=how.get("reason"),

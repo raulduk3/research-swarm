@@ -12,7 +12,7 @@ from research_agent.beta.db import connect, loads
 from research_agent.beta.config import BetaConfig
 from research_agent.beta.evolution import maybe_run_evolution
 from research_agent.beta.methods import CATALOG
-from tests.beta.helpers import FakeClock
+from tests.beta.helpers import PROVIDER, FakeClock, ScriptedClient, call, reply
 from tests.beta.test_runs import _create, _store
 
 
@@ -142,22 +142,34 @@ def test_evolution_child_keeps_its_islands_methods_after_mating(
         assert label not in child["research_methods"]["instructions"]
 
 
-def test_oversized_mating_records_refusal_and_preserves_population(
+def test_oversized_proposal_is_refused_and_recorded(
     db: sqlite3.Connection, clock: FakeClock
 ) -> None:
     _, doc = specs.current_spec(db)
-    for island in doc["islands"]:
-        for genome in island["genomes"]:
-            genome["prompt"] = "Long custom posture. " + genome["id"] * (
-                7800 // len(genome["id"])
-            )
+    reader = specs.find_genome(doc, "cs-reader")[1]
+    reader["prompt"] = "Long custom posture. " + "x" * 7970 + "."
     specs.apply_spec(db, doc, actor="operator", now=clock())
-    before = specs.current_spec(db)
-    result = maybe_run_evolution(db, "cs", clock(), force=True)
-    assert result is not None
-    assert result["reason"] == "invalid_child"
-    assert result["decisions"][0]["why"] == "must be at most 8000 characters"
-    assert specs.current_spec(db) == before
+    _, doc = specs.current_spec(db)
+    reader = specs.find_genome(doc, "cs-reader")[1]
+    # One added sentence is one change, but it takes the prompt over its limit.
+    oversized = {
+        "parents": ["cs-reader"],
+        "prompt": reader["prompt"] + " Say why it matters to anyone.",
+        "reading_strategy": reader["reading_strategy"],
+        "temperature": reader["model_settings"]["temperature"],
+        "why": "one more sentence",
+    }
+    client = ScriptedClient([reply(call("propose_child", oversized))])
+    result = maybe_run_evolution(
+        db, "cs", clock(), force=True, provider=PROVIDER, client=client
+    )
+    assert result is not None and result["status"] == "committed"
+    created = next(d for d in result["decisions"] if d["decision"] == "created")
+    assert created["reason"] == "rule_mating"
+    assert created["proposal"] == "invalid_proposal"
+    assert created["proposal_reason"] == "must be at most 8000 characters"
+    _, after = specs.current_spec(db)
+    assert len(specs.find_genome(after, "cs-gen1")[1]["prompt"]) <= 8000
 
 
 def test_source_metadata_does_not_make_a_duplicate_mutation_novel() -> None:
@@ -348,8 +360,9 @@ def test_mating_keeps_the_parents_methods_and_says_an_instruction_once() -> None
     assert child["prompt"].count("Check claims.") == 1
 
 
-def test_chained_mating_adds_one_emphasis_and_no_methods() -> None:
-    from research_agent.beta.evolution import mate_genomes
+def test_chained_mating_moves_one_sentence_at_a_time() -> None:
+    from research_agent.beta.evolution import changes, mate_genomes
+    from research_agent.beta.methods import instruction_units
 
     doc = specs.default_spec()
     cs = doc["islands"][0]["genomes"]
@@ -358,20 +371,27 @@ def test_chained_mating_adds_one_emphasis_and_no_methods() -> None:
     first = mate_genomes(cs[0], quant_skeptic, cs, "chain-1")
     assert first is not None
     child = {"id": "cs-gen1", **first[0]}
-    assert "before believing" in child["prompt"]
     second = mate_genomes(child, bio_builder, [*cs, child], "chain-2")
     assert second is not None
     grandchild = second[0]
-    # The grandchild carries its grandparent's own words and the builder's
-    # bent, not the skeptic's as well, and only its island's methods.
-    assert grandchild["prompt"].count("Additional reading emphasis:") == 1
-    assert grandchild["prompt"].startswith(cs[0]["prompt"].split(". ")[0])
-    assert "before believing" not in grandchild["prompt"]
-    assert "opens a door" in grandchild["prompt"]
-    assert grandchild["research_methods"] == cs[0]["research_methods"]
-    assert len(grandchild["research_methods"]["instructions"]) == len(
-        cs[0]["research_methods"]["instructions"]
+    # Each generation differs from the one before in exactly one place, taken
+    # from the mate; the first sentence, which names the island, never moves;
+    # the island's methods come along unchanged.
+    for before, after, description in (
+        (cs[0], child, first[1]),
+        (child, grandchild, second[1]),
+    ):
+        assert len(changes(before, after)) == 1
+        assert description["source"] == "mate"
+        assert (
+            instruction_units(after["prompt"])[0]
+            == instruction_units(before["prompt"])[0]
+        )
+    assert (
+        len(instruction_units(grandchild["prompt"]))
+        <= len(instruction_units(cs[0]["prompt"])) + 2
     )
+    assert grandchild["research_methods"] == cs[0]["research_methods"]
 
 
 def test_new_agent_prompt_removes_repeated_instructions() -> None:
